@@ -1,0 +1,24 @@
+[package]
+name = "ccswitch"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ccswitch"
+path = "src/main.rs"
+
+[dependencies]
+ccswitch-core = { path = "../ccswitch-core" }
+ccswitch-db = { path = "../ccswitch-db" }
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
