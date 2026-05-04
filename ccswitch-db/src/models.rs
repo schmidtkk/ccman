@@ -1,4 +1,4 @@
-use rusqlite::{Row, Result as SqliteResult};
+use rusqlite::{Result as SqliteResult, Row};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------

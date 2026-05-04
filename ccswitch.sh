@@ -6,11 +6,11 @@
 
 unset ANTHROPIC_API_KEY
 
-# ── API keys (exported so Rust binary can import on first run) ───────────────
-export GLM_API_KEY="2759e573bb3c40b9a88053f751f31638.WF3F2ZEVj9s158IK"
-export MINIMAX_API_KEY="sk-cp-4lgbzZU_582H4nizTfJRP8KrLPmSH-9rMKpvtwk4D9HQrz6HEQCCRbI82-Qe-_pJfMajKdKTFpHosedLeBLwpdF9FcLzYHc66udQyWPpxUNkZHcnB2fsVCY"
-export ZHONGZHUAN_API_KEY="sk-zNQxU498oqb99SikkJmvvjhib24BdypczoMETmPnDwYANzLm"
-export KIMI_API_KEY="sk-kimi-T7bFyp96UIJLOr5YJUFkoI3786ozEyUIQ5MKSdZHUcjTaks4LnCxKgGpvtNxg5jD"
+# ── Load API keys from .env (gitignored) ─────────────────────────────────────
+_CCSWITCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$_CCSWITCH_DIR/.env" ]]; then
+    source "$_CCSWITCH_DIR/.env"
+fi
 
 # ── Binary path ──────────────────────────────────────────────────────────────
 _CCSWITCH_BIN="${CCSWITCH_BIN:-$HOME/workspace/ccswitch/target/release/ccswitch}"
@@ -20,15 +20,10 @@ _ccswitch_run() {
     local output
     output=$("$_CCSWITCH_BIN" "$@" 2>/dev/null)
     local status=$?
-    # Eval export/unset commands so current shell stays in sync
     while IFS= read -r line; do
         if [[ "$line" == export\ * || "$line" == unset\ * ]]; then
             eval "$line"
-        fi
-    done <<< "$output"
-    # Print non-shell-command lines
-    while IFS= read -r line; do
-        if [[ "$line" != export\ * && "$line" != unset\ * ]]; then
+        else
             echo "$line"
         fi
     done <<< "$output"

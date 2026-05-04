@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 use crate::provider::{EnvVars, CCSWITCH_ENV_KEYS};
 
@@ -24,11 +24,12 @@ impl SettingsManager {
     }
 
     /// Write environment variables to ~/.claude/settings.json
-    pub fn write_env_vars(&self,
-        env_vars: &EnvVars,
-    ) -> Result<()> {
+    pub fn write_env_vars(&self, env_vars: &EnvVars) -> Result<()> {
         if !self.path.exists() {
-            anyhow::bail!("Claude Code settings file not found: {}", self.path.display());
+            anyhow::bail!(
+                "Claude Code settings file not found: {}",
+                self.path.display()
+            );
         }
 
         let content = fs::read_to_string(&self.path)?;
@@ -68,10 +69,12 @@ impl SettingsManager {
     }
 
     /// Clear all managed environment variables (native Claude mode)
-    pub fn clear_env_vars(&self,
-    ) -> Result<()> {
+    pub fn clear_env_vars(&self) -> Result<()> {
         if !self.path.exists() {
-            anyhow::bail!("Claude Code settings file not found: {}", self.path.display());
+            anyhow::bail!(
+                "Claude Code settings file not found: {}",
+                self.path.display()
+            );
         }
 
         let content = fs::read_to_string(&self.path)?;
@@ -94,8 +97,7 @@ impl SettingsManager {
     }
 
     /// Read current .env from settings.json (for display purposes)
-    pub fn read_current_env(&self,
-    ) -> Result<Option<Value>> {
+    pub fn read_current_env(&self) -> Result<Option<Value>> {
         if !self.path.exists() {
             return Ok(None);
         }

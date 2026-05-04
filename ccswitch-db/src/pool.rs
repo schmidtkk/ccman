@@ -1,8 +1,18 @@
 use anyhow::Result;
-use r2d2::Pool;
+use r2d2::{CustomizeConnection, Pool};
 use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::Connection;
 use std::path::Path;
-use tracing::{info, debug};
+use tracing::info;
+
+#[derive(Debug)]
+struct ForeignKeysOn;
+
+impl CustomizeConnection<Connection, rusqlite::Error> for ForeignKeysOn {
+    fn on_acquire(&self, conn: &mut Connection) -> Result<(), rusqlite::Error> {
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DatabasePool {
@@ -23,6 +33,7 @@ impl DatabasePool {
         let manager = SqliteConnectionManager::file(db_path);
         let pool = Pool::builder()
             .max_size(10)
+            .connection_customizer(Box::new(ForeignKeysOn))
             .build(manager)?;
 
         info!("Database pool created: {}", db_path.display());
@@ -30,11 +41,10 @@ impl DatabasePool {
         Ok(Self { pool })
     }
 
-    /// Run migrations from the given SQL string.
-    pub fn run_migrations(&self, sql: &str) -> Result<()> {
+    /// Execute a batch of SQL statements.
+    pub fn execute_batch(&self, sql: &str) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute_batch(sql)?;
-        debug!("Migrations applied successfully");
         Ok(())
     }
 

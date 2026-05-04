@@ -42,6 +42,12 @@ pub enum Commands {
         command: HealthCommands,
     },
 
+    /// Manage providers
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommands,
+    },
+
     /// Launch interactive TUI
     Tui,
 }
@@ -144,4 +150,74 @@ pub enum HealthCommands {
 
     /// Show latest health status for all keys
     Status,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProviderCommands {
+    /// Add a new provider
+    Add {
+        /// Provider identifier (e.g., openrouter, deepseek)
+        name: String,
+
+        /// Display name (e.g., "OpenRouter")
+        display_name: String,
+
+        /// Base URL for API requests
+        base_url: String,
+
+        /// Default model (optional)
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Auth header format (default: "Authorization: Bearer")
+        #[arg(long, default_value = "Authorization: Bearer")]
+        auth_header: String,
+
+        /// Request timeout in milliseconds (default: 60000)
+        #[arg(long, default_value_t = 60000)]
+        timeout_ms: i64,
+
+        /// Disable non-essential traffic for this provider
+        #[arg(long, default_value_t = false)]
+        requires_disable_traffic: bool,
+    },
+
+    /// List all providers
+    List,
+
+    /// Edit an existing provider
+    Edit {
+        /// Provider name
+        name: String,
+
+        /// New display name
+        #[arg(long)]
+        display_name: Option<String>,
+
+        /// New base URL
+        #[arg(long)]
+        base_url: Option<String>,
+
+        /// New model
+        #[arg(long)]
+        model: Option<String>,
+
+        /// New auth header
+        #[arg(long)]
+        auth_header: Option<String>,
+
+        /// New timeout in milliseconds
+        #[arg(long)]
+        timeout_ms: Option<i64>,
+
+        /// Toggle disable non-essential traffic
+        #[arg(long)]
+        requires_disable_traffic: Option<bool>,
+    },
+
+    /// Remove a provider by name
+    Remove {
+        /// Provider name
+        name: String,
+    },
 }

@@ -37,11 +37,7 @@ where
     }
 
     /// Check health of a single API key
-    pub fn check_key(
-        &self,
-        key: &ApiKey,
-        provider: &Provider,
-    ) -> Result<HealthCheckResult> {
+    pub fn check_key(&self, key: &ApiKey, provider: &Provider) -> Result<HealthCheckResult> {
         let start = Instant::now();
 
         let url = if provider.base_url.is_empty() {
@@ -67,8 +63,7 @@ where
         match response {
             Ok(resp) => {
                 let status = resp.status();
-                if status.is_success() || status.as_u16() == 401 || status.as_u16() == 403 {
-                    // 401/403 means endpoint is up but key auth failed - still "healthy" endpoint
+                if status.is_success() {
                     Ok(HealthCheckResult {
                         is_healthy: true,
                         response_time_ms: Some(latency),
@@ -95,9 +90,7 @@ where
     }
 
     /// Run health check for all keys of a provider, record results
-    pub fn check_provider(&self,
-        provider_name: &str,
-    ) -> Result<Vec<KeyCheckResult>> {
+    pub fn check_provider(&self, provider_name: &str) -> Result<Vec<KeyCheckResult>> {
         let provider = self
             .provider_repo
             .get_by_name(provider_name)?
@@ -122,7 +115,11 @@ where
 
             // Update key error count if unhealthy
             if !check_result.is_healthy {
-                self.api_key_repo.update_usage_stats(key.id, false, check_result.error_message.as_deref())?;
+                self.api_key_repo.update_usage_stats(
+                    key.id,
+                    false,
+                    check_result.error_message.as_deref(),
+                )?;
                 warn!(
                     "Key {} for provider {} is unhealthy: {:?}",
                     key.id, provider_name, check_result.error_message
@@ -153,8 +150,7 @@ where
     }
 
     /// Check all providers
-    pub fn check_all(&self,
-    ) -> Result<Vec<(Provider, Vec<KeyCheckResult>)>> {
+    pub fn check_all(&self) -> Result<Vec<(Provider, Vec<KeyCheckResult>)>> {
         let providers = self.provider_repo.list()?;
         let mut all_results = Vec::new();
 
@@ -163,43 +159,7 @@ where
                 continue;
             }
 
-            let keys = self.api_key_repo.list_by_provider(provider.id)?;
-            if keys.is_empty() {
-                continue;
-            }
-
-            let mut results = Vec::new();
-            for key in keys {
-                let check_result = self.check_key(&key, &provider)?;
-
-                let health_check = HealthCheck {
-                    id: 0,
-                    api_key_id: key.id,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    is_healthy: check_result.is_healthy,
-                    response_time_ms: check_result.response_time_ms,
-                    error_message: check_result.error_message.clone(),
-                };
-                self.health_repo.create(&health_check)?;
-
-                if !check_result.is_healthy {
-                    self.api_key_repo.update_usage_stats(key.id, false, check_result.error_message.as_deref())?;
-                } else {
-                    let mut updated_key = key.clone();
-                    updated_key.error_count = 0;
-                    updated_key.last_error_at = None;
-                    self.api_key_repo.update(&updated_key)?;
-                }
-
-                results.push(KeyCheckResult {
-                    key_id: key.id,
-                    key_label: key.key_label,
-                    is_healthy: check_result.is_healthy,
-                    response_time_ms: check_result.response_time_ms,
-                    error_message: check_result.error_message,
-                });
-            }
-
+            let results = self.check_provider(&provider.name)?;
             if !results.is_empty() {
                 all_results.push((provider, results));
             }

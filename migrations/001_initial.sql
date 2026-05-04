@@ -95,21 +95,3 @@ CREATE TABLE IF NOT EXISTS settings_metadata (
 
 -- Insert default active provider (none)
 INSERT OR IGNORE INTO settings_metadata (key, value) VALUES ('active_provider_id', 'NULL');
-
--- Seed default providers
-INSERT OR IGNORE INTO providers (name, display_name, base_url, model, timeout_ms, requires_disable_traffic) VALUES
-    ('kimi', 'Kimi k2.6', 'https://api.kimi.com/coding/', 'kimi-for-coding', 3000000, 1),
-    ('glm', 'GLM-5', 'https://open.bigmodel.cn/api/anthropic', 'glm-5', 60000, 0),
-    ('minimax', 'MiniMax M2.7', 'https://api.minimax.io/anthropic', 'MiniMax-M2.7', 3000000, 1),
-    ('zhongzhuan', 'Zhongzhuan relay', 'https://cc1.zhihuiapi.top', NULL, 600000, 1),
-    ('claude', 'Native Claude', '', NULL, 60000, 0);
-
--- Seed pricing data (use fixed date to avoid duplicates on re-run)
-INSERT OR IGNORE INTO pricing (provider_id, model, input_price_cents_per_million, output_price_cents_per_million, effective_date)
-SELECT id, 'kimi-for-coding', 120, 120, '2026-01-01 00:00:00' FROM providers WHERE name = 'kimi';
-
-INSERT OR IGNORE INTO pricing (provider_id, model, input_price_cents_per_million, output_price_cents_per_million, effective_date)
-SELECT id, 'glm-5', 50, 50, '2026-01-01 00:00:00' FROM providers WHERE name = 'glm';
-
-INSERT OR IGNORE INTO pricing (provider_id, model, input_price_cents_per_million, output_price_cents_per_million, effective_date)
-SELECT id, 'MiniMax-M2.7', 10, 10, '2026-01-01 00:00:00' FROM providers WHERE name = 'minimax';

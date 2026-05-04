@@ -40,7 +40,10 @@ impl EnvVars {
             pairs.push(("API_TIMEOUT_MS".to_string(), v.clone()));
         }
         if let Some(v) = &self.claude_code_disable_nonessential_traffic {
-            pairs.push(("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(), v.clone()));
+            pairs.push((
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
+                v.clone(),
+            ));
         }
         pairs
     }
@@ -51,6 +54,15 @@ impl EnvVars {
             && self.anthropic_model.is_none()
             && self.api_timeout_ms.is_none()
             && self.claude_code_disable_nonessential_traffic.is_none()
+    }
+}
+
+/// Normalize provider name aliases (e.g., "cc" -> "claude", "zz" -> "zhongzhuan")
+pub fn normalize_provider_name(name: &str) -> &str {
+    match name {
+        "cc" => "claude",
+        "zz" => "zhongzhuan",
+        other => other,
     }
 }
 
@@ -80,15 +92,6 @@ where
         }
     }
 
-    /// Normalize provider name aliases (e.g., "cc" -> "claude")
-    fn normalize_name(name: &str) -> &str {
-        match name {
-            "cc" => "claude",
-            "zz" => "zhongzhuan",
-            other => other,
-        }
-    }
-
     /// List all providers
     pub fn list_providers(&self) -> Result<Vec<Provider>> {
         self.provider_repo.list()
@@ -96,20 +99,20 @@ where
 
     /// Get provider by name
     pub fn get_provider(&self, name: &str) -> Result<Option<Provider>> {
-        let name = Self::normalize_name(name);
+        let name = normalize_provider_name(name);
         self.provider_repo.get_by_name(name)
     }
 
     /// Get environment variables for a provider (shell env mode)
-    pub fn get_env_vars(&self,
-        provider_name: &str,
-    ) -> Result<EnvVars> {
-        let provider_name = Self::normalize_name(provider_name);
-        let provider = self.provider_repo
+    pub fn get_env_vars(&self, provider_name: &str) -> Result<EnvVars> {
+        let provider_name = normalize_provider_name(provider_name);
+        let provider = self
+            .provider_repo
             .get_by_name(provider_name)?
             .with_context(|| format!("Provider not found: {}", provider_name))?;
 
-        let key = self.api_key_repo
+        let key = self
+            .api_key_repo
             .get_best_key_for_provider(provider.id)?
             .with_context(|| format!("No API key available for provider: {}", provider_name))?;
 
@@ -137,11 +140,10 @@ where
     }
 
     /// Switch to a provider (update active provider in DB)
-    pub fn switch_to_provider(&self,
-        provider_name: &str,
-    ) -> Result<EnvVars> {
-        let provider_name = Self::normalize_name(provider_name);
-        let provider = self.provider_repo
+    pub fn switch_to_provider(&self, provider_name: &str) -> Result<EnvVars> {
+        let provider_name = normalize_provider_name(provider_name);
+        let provider = self
+            .provider_repo
             .get_by_name(provider_name)?
             .with_context(|| format!("Provider not found: {}", provider_name))?;
 
@@ -158,14 +160,34 @@ where
             });
         }
 
-        let key = self.api_key_repo
+        let key = self
+            .api_key_repo
             .get_best_key_for_provider(provider.id)?
             .with_context(|| format!("No API key available for provider: {}", provider_name))?;
 
-        let env_vars = self.get_env_vars(provider_name)?;
+        let env_vars = EnvVars {
+            anthropic_base_url: if provider.base_url.is_empty() {
+                None
+            } else {
+                Some(provider.base_url.clone())
+            },
+            anthropic_auth_token: Some(key.key_value.clone()),
+            anthropic_model: provider.model.clone(),
+            api_timeout_ms: if provider.timeout_ms > 0 {
+                Some(provider.timeout_ms.to_string())
+            } else {
+                None
+            },
+            claude_code_disable_nonessential_traffic: if provider.requires_disable_traffic {
+                Some("1".to_string())
+            } else {
+                None
+            },
+        };
 
         // Update active provider in settings
-        self.settings_repo.set_active_provider_id(Some(provider.id))?;
+        self.settings_repo
+            .set_active_provider_id(Some(provider.id))?;
 
         // Update key usage stats
         self.api_key_repo.update_usage_stats(key.id, true, None)?;
@@ -180,8 +202,7 @@ where
     }
 
     /// Get current active provider
-    pub fn get_active_provider(&self,
-    ) -> Result<Option<(Provider, ApiKey)>> {
+    pub fn get_active_provider(&self) -> Result<Option<(Provider, ApiKey)>> {
         let active_id = self.settings_repo.get_active_provider_id()?;
 
         match active_id {
@@ -261,6 +282,67 @@ where
     pub fn remove_key(&self, key_id: i64) -> Result<()> {
         self.api_key_repo.delete(key_id)?;
         info!("Removed key id={}", key_id);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Provider CRUD
+    // -----------------------------------------------------------------------
+
+    /// Add a new provider
+    pub fn add_provider(&self, provider: Provider) -> Result<i64> {
+        let id = self.provider_repo.create(&provider)?;
+        info!("Added provider: {} (id={})", provider.name, id);
+        Ok(id)
+    }
+
+    /// Update an existing provider by name
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_provider(
+        &self,
+        name: &str,
+        display_name: Option<String>,
+        base_url: Option<String>,
+        model: Option<String>,
+        auth_header: Option<String>,
+        timeout_ms: Option<i64>,
+        requires_disable_traffic: Option<bool>,
+    ) -> Result<()> {
+        let mut provider = self
+            .get_provider(name)?
+            .with_context(|| format!("Provider not found: {}", name))?;
+
+        if let Some(v) = display_name {
+            provider.display_name = v;
+        }
+        if let Some(v) = base_url {
+            provider.base_url = v;
+        }
+        if let Some(v) = model {
+            provider.model = Some(v);
+        }
+        if let Some(v) = auth_header {
+            provider.auth_header = v;
+        }
+        if let Some(v) = timeout_ms {
+            provider.timeout_ms = v;
+        }
+        if let Some(v) = requires_disable_traffic {
+            provider.requires_disable_traffic = v;
+        }
+
+        self.provider_repo.update(&provider)?;
+        info!("Updated provider: {}", name);
+        Ok(())
+    }
+
+    /// Remove a provider by name
+    pub fn remove_provider(&self, name: &str) -> Result<()> {
+        let provider = self
+            .get_provider(name)?
+            .with_context(|| format!("Provider not found: {}", name))?;
+        self.provider_repo.delete(provider.id)?;
+        info!("Removed provider: {}", name);
         Ok(())
     }
 }

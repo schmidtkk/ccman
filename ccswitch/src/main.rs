@@ -4,28 +4,46 @@ mod tui;
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 use ccswitch_core::health_check::HealthCheckService;
-use ccswitch_core::provider::ProviderService;
+use ccswitch_core::provider::{normalize_provider_name, ProviderService};
 use ccswitch_core::settings::SettingsManager;
 use ccswitch_core::usage_tracker::UsageTracker;
 use ccswitch_db::migrations::run_migrations_from_dir;
 use ccswitch_db::pool::DatabasePool;
 use ccswitch_db::repositories::{
-    ApiKeyRepository, ProviderRepository,
-    SqliteApiKeyRepository, SqliteProviderRepository, SqliteSettingsRepository,
-    SqliteUsageLogRepository, SqlitePricingRepository, SqliteHealthCheckRepository,
+    ApiKeyRepository, ProviderRepository, SqliteApiKeyRepository, SqliteHealthCheckRepository,
+    SqlitePricingRepository, SqliteProviderRepository, SqliteSettingsRepository,
+    SqliteUsageLogRepository,
 };
 
-fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+type ProviderServiceType =
+    ProviderService<SqliteProviderRepository, SqliteApiKeyRepository, SqliteSettingsRepository>;
 
+/// Services bundle returned by initialize().
+type Services = (
+    ProviderServiceType,
+    SettingsManager,
+    SqliteUsageLogRepository,
+    SqlitePricingRepository,
+    SqliteHealthCheckRepository,
+    DatabasePool,
+);
+
+fn main() -> Result<()> {
     let cli = cli::Cli::parse();
 
+    // Send tracing to stderr so stdout stays clean for shell wrapper protocol
+    if !matches!(cli.command, cli::Commands::Tui) {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
     // Initialize database and services
-    let (provider_service, settings_manager, usage_repo, pricing_repo, health_repo, pool) = initialize()?;
+    let (provider_service, settings_manager, usage_repo, pricing_repo, health_repo, pool) =
+        initialize()?;
 
     match cli.command {
         cli::Commands::List => {
@@ -40,30 +58,22 @@ fn main() -> Result<()> {
             }
         }
         cli::Commands::Use { provider } => {
-            // Normalize provider aliases (e.g., "cc" -> "claude")
-            let provider = match provider.as_str() {
-                "cc" => "claude".to_string(),
-                "zz" => "zhongzhuan".to_string(),
-                _ => provider,
-            };
-
             let env_vars = provider_service.switch_to_provider(&provider)?;
+            let normalized = normalize_provider_name(&provider);
 
-            if provider == "claude" {
+            if normalized == "claude" {
                 settings_manager.clear_env_vars()?;
                 println!("Switched to native Claude");
-
-                // Print unset commands for shell integration
-                println!("\n# Run these commands in your shell:");
                 for key in &ccswitch_core::provider::CCSWITCH_ENV_KEYS {
                     println!("unset {}", key);
                 }
             } else {
                 settings_manager.write_env_vars(&env_vars)?;
-                println!("Switched to {}", provider);
-
-                // Print export commands for shell integration
-                println!("\n# Run these commands in your shell:");
+                let display = provider_service
+                    .get_provider(normalized)?
+                    .map(|p| p.display_name.clone())
+                    .unwrap_or_else(|| normalized.to_string());
+                println!("Switched to {}", display);
                 for (key, value) in env_vars.to_export_pairs() {
                     println!("export {}={}", key, shell_escape(&value));
                 }
@@ -74,12 +84,16 @@ fn main() -> Result<()> {
 
             match active {
                 Some((provider, key)) => {
-                    println!("Current provider: {} ({})", provider.display_name, provider.name);
+                    println!(
+                        "Current provider: {} ({})",
+                        provider.display_name, provider.name
+                    );
                     if let Some(model) = &provider.model {
                         println!("Model: {}", model);
                     }
                     println!("Base URL: {}", provider.base_url);
-                    println!("Key: {} ({} chars)",
+                    println!(
+                        "Key: {} ({} chars)",
                         key.key_label.as_deref().unwrap_or("unnamed"),
                         key.key_value.len()
                     );
@@ -92,25 +106,36 @@ fn main() -> Result<()> {
                 }
             }
 
-            // Show settings.json .env block
+            // Show settings.json .env block (with sensitive values masked)
             if let Ok(Some(env)) = settings_manager.read_current_env() {
+                let mut masked = env;
+                if let Some(obj) = masked.as_object_mut() {
+                    if let Some(token) = obj.get_mut("ANTHROPIC_AUTH_TOKEN") {
+                        if let Some(s) = token.as_str() {
+                            *token = serde_json::json!(mask_key(s));
+                        }
+                    }
+                }
                 println!("\nClaude settings.json .env:");
-                println!("{}", serde_json::to_string_pretty(&env)?);
+                println!("{}", serde_json::to_string_pretty(&masked)?);
             }
         }
-        cli::Commands::Key { command } => {
-            match command {
-                cli::KeyCommands::Add { provider, key, label, priority } => {
-                    handle_key_add(&provider_service, &provider, key, label, priority)?;
-                }
-                cli::KeyCommands::List { provider } => {
-                    handle_key_list(&provider_service, provider.as_deref())?;
-                }
-                cli::KeyCommands::Remove { id } => {
-                    handle_key_remove(&provider_service, id)?;
-                }
+        cli::Commands::Key { command } => match command {
+            cli::KeyCommands::Add {
+                provider,
+                key,
+                label,
+                priority,
+            } => {
+                handle_key_add(&provider_service, &provider, key, label, priority)?;
             }
-        }
+            cli::KeyCommands::List { provider } => {
+                handle_key_list(&provider_service, provider.as_deref())?;
+            }
+            cli::KeyCommands::Remove { id } => {
+                handle_key_remove(&provider_service, id)?;
+            }
+        },
         cli::Commands::Usage { command } => {
             let tracker = UsageTracker::new(usage_repo, pricing_repo);
             match command {
@@ -120,14 +145,32 @@ fn main() -> Result<()> {
                 cli::UsageCommands::Month => {
                     handle_usage_month(&tracker)?;
                 }
-                cli::UsageCommands::Total { start, end, by_provider } => {
+                cli::UsageCommands::Total {
+                    start,
+                    end,
+                    by_provider,
+                } => {
                     handle_usage_total(&tracker, start, end, by_provider)?;
                 }
                 cli::UsageCommands::Logs { limit } => {
                     handle_usage_logs(&tracker, limit)?;
                 }
-                cli::UsageCommands::Log { provider, model, prompt, completion, request_id } => {
-                    handle_usage_log(&provider_service, &tracker, &provider, &model, prompt, completion, request_id)?;
+                cli::UsageCommands::Log {
+                    provider,
+                    model,
+                    prompt,
+                    completion,
+                    request_id,
+                } => {
+                    handle_usage_log(
+                        &provider_service,
+                        &tracker,
+                        &provider,
+                        &model,
+                        prompt,
+                        completion,
+                        request_id,
+                    )?;
                 }
             }
         }
@@ -146,6 +189,54 @@ fn main() -> Result<()> {
                 }
             }
         }
+        cli::Commands::Provider { command } => match command {
+            cli::ProviderCommands::Add {
+                name,
+                display_name,
+                base_url,
+                model,
+                auth_header,
+                timeout_ms,
+                requires_disable_traffic,
+            } => {
+                handle_provider_add(
+                    &provider_service,
+                    name,
+                    display_name,
+                    base_url,
+                    model,
+                    auth_header,
+                    timeout_ms,
+                    requires_disable_traffic,
+                )?;
+            }
+            cli::ProviderCommands::List => {
+                handle_provider_list(&provider_service)?;
+            }
+            cli::ProviderCommands::Edit {
+                name,
+                display_name,
+                base_url,
+                model,
+                auth_header,
+                timeout_ms,
+                requires_disable_traffic,
+            } => {
+                handle_provider_edit(
+                    &provider_service,
+                    name,
+                    display_name,
+                    base_url,
+                    model,
+                    auth_header,
+                    timeout_ms,
+                    requires_disable_traffic,
+                )?;
+            }
+            cli::ProviderCommands::Remove { name } => {
+                handle_provider_remove(&provider_service, &name)?;
+            }
+        },
         cli::Commands::Tui => {
             tui::run(pool)?;
         }
@@ -154,18 +245,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn initialize() -> Result<(
-    ProviderService<
-        SqliteProviderRepository,
-        SqliteApiKeyRepository,
-        SqliteSettingsRepository,
-    >,
-    SettingsManager,
-    SqliteUsageLogRepository,
-    SqlitePricingRepository,
-    SqliteHealthCheckRepository,
-    DatabasePool,
-)> {
+fn initialize() -> Result<Services> {
     // Determine database path
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let db_path = home.join(".ccswitch").join("ccswitch.db");
@@ -179,11 +259,18 @@ fn initialize() -> Result<(
     let exe_dir = exe_path.parent().context("Could not get exe directory")?;
 
     // Try multiple locations for migrations
-    let migrations_paths = [
+    let mut migrations_paths = vec![
         exe_dir.join("../migrations"),
         exe_dir.join("../../migrations"),
-        PathBuf::from("/home/weidongguo/workspace/ccswitch/migrations"),
     ];
+
+    // Development fallback: use CARGO_MANIFEST_DIR when running from cargo
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let dev_path = PathBuf::from(manifest_dir).join("../migrations");
+        if dev_path.exists() {
+            migrations_paths.push(dev_path);
+        }
+    }
 
     let mut migrations_applied = false;
     for migrations_dir in &migrations_paths {
@@ -214,7 +301,14 @@ fn initialize() -> Result<(
     let provider_service = ProviderService::new(provider_repo, api_key_repo, settings_repo);
     let settings_manager = SettingsManager::new()?;
 
-    Ok((provider_service, settings_manager, usage_repo, pricing_repo, health_repo, pool))
+    Ok((
+        provider_service,
+        settings_manager,
+        usage_repo,
+        pricing_repo,
+        health_repo,
+        pool,
+    ))
 }
 
 /// Import existing API keys from environment variables into the database.
@@ -254,11 +348,7 @@ fn import_existing_keys(
                         created_at: chrono::Utc::now().to_rfc3339(),
                     };
                     api_key_repo.create(&key)?;
-                    tracing::info!(
-                        "Imported API key for {} from {}",
-                        provider_name,
-                        env_var
-                    );
+                    tracing::info!("Imported API key for {} from {}", provider_name, env_var);
                 }
             }
         }
@@ -268,11 +358,7 @@ fn import_existing_keys(
 }
 
 fn handle_key_add(
-    provider_service: &ProviderService<
-        SqliteProviderRepository,
-        SqliteApiKeyRepository,
-        SqliteSettingsRepository,
-    >,
+    provider_service: &ProviderServiceType,
     provider_name: &str,
     key_value: String,
     label: Option<String>,
@@ -284,11 +370,7 @@ fn handle_key_add(
 }
 
 fn handle_key_list(
-    provider_service: &ProviderService<
-        SqliteProviderRepository,
-        SqliteApiKeyRepository,
-        SqliteSettingsRepository,
-    >,
+    provider_service: &ProviderServiceType,
     provider_name: Option<&str>,
 ) -> Result<()> {
     if let Some(name) = provider_name {
@@ -304,9 +386,9 @@ fn handle_key_list(
             for k in keys {
                 let status = if k.is_active { "active" } else { "inactive" };
                 let label = k.key_label.as_deref().unwrap_or("unnamed");
-                let preview = &k.key_value[..20.min(k.key_value.len())];
+                let preview = mask_key(&k.key_value);
                 println!(
-                    "  {:3} | {:8} | p={} | errs={} | {}... | {}",
+                    "  {:3} | {:8} | p={} | errs={} | {} | {}",
                     k.id, status, k.priority, k.error_count, preview, label
                 );
             }
@@ -322,9 +404,9 @@ fn handle_key_list(
             for k in keys {
                 let status = if k.is_active { "active" } else { "inactive" };
                 let label = k.key_label.as_deref().unwrap_or("unnamed");
-                let preview = &k.key_value[..20.min(k.key_value.len())];
+                let preview = mask_key(&k.key_value);
                 println!(
-                    "  {:3} | {:8} | p={} | errs={} | {}... | {}",
+                    "  {:3} | {:8} | p={} | errs={} | {} | {}",
                     k.id, status, k.priority, k.error_count, preview, label
                 );
             }
@@ -333,14 +415,7 @@ fn handle_key_list(
     Ok(())
 }
 
-fn handle_key_remove(
-    provider_service: &ProviderService<
-        SqliteProviderRepository,
-        SqliteApiKeyRepository,
-        SqliteSettingsRepository,
-    >,
-    id: i64,
-) -> Result<()> {
+fn handle_key_remove(provider_service: &ProviderServiceType, id: i64) -> Result<()> {
     provider_service.remove_key(id)?;
     println!("Removed key {}", id);
     Ok(())
@@ -373,7 +448,10 @@ fn handle_usage_month(
         return Ok(());
     }
 
-    println!("{:<12} {:>8} {:>12} {:>12} {:>12}", "Date", "Requests", "Prompt", "Completion", "Cost");
+    println!(
+        "{:<12} {:>8} {:>12} {:>12} {:>12}",
+        "Date", "Requests", "Prompt", "Completion", "Cost"
+    );
     println!("{}", "-".repeat(60));
     let mut total_requests = 0;
     let mut total_tokens = 0;
@@ -420,7 +498,10 @@ fn handle_usage_total(
             println!("No usage recorded for {} to {}.", start, end);
             return Ok(());
         }
-        println!("{:<16} {:>8} {:>12} {:>12}", "Provider", "Requests", "Tokens", "Cost");
+        println!(
+            "{:<16} {:>8} {:>12} {:>12}",
+            "Provider", "Requests", "Tokens", "Cost"
+        );
         println!("{}", "-".repeat(52));
         for stat in &stats {
             println!(
@@ -451,7 +532,10 @@ fn handle_usage_logs(
         return Ok(());
     }
 
-    println!("{:<6} {:<12} {:<20} {:>8} {:>8} {:>8}", "ID", "Provider", "Model", "Prompt", "Comp", "Cost");
+    println!(
+        "{:<6} {:<12} {:<20} {:>8} {:>8} {:>8}",
+        "ID", "Provider", "Model", "Prompt", "Comp", "Cost"
+    );
     println!("{}", "-".repeat(70));
     for log in &logs {
         let ts = &log.timestamp[..19.min(log.timestamp.len())];
@@ -471,11 +555,7 @@ fn handle_usage_logs(
 }
 
 fn handle_usage_log(
-    provider_service: &ProviderService<
-        SqliteProviderRepository,
-        SqliteApiKeyRepository,
-        SqliteSettingsRepository,
-    >,
+    provider_service: &ProviderServiceType,
     tracker: &UsageTracker<SqliteUsageLogRepository, SqlitePricingRepository>,
     provider_name: &str,
     model: &str,
@@ -496,7 +576,10 @@ fn handle_usage_log(
         request_id.as_deref(),
     )?;
 
-    println!("Logged usage entry id={} for {} ({}/{})", id, provider_name, prompt, completion);
+    println!(
+        "Logged usage entry id={} for {} ({}/{})",
+        id, provider_name, prompt, completion
+    );
     Ok(())
 }
 
@@ -516,9 +599,19 @@ fn handle_health_check(
         } else {
             for r in results {
                 let status = if r.is_healthy { "OK" } else { "FAIL" };
-                let latency = r.response_time_ms.map(|ms| format!("{}ms", ms)).unwrap_or_else(|| "-".to_string());
+                let latency = r
+                    .response_time_ms
+                    .map(|ms| format!("{}ms", ms))
+                    .unwrap_or_else(|| "-".to_string());
                 let label = r.key_label.as_deref().unwrap_or("unnamed");
-                println!("  {:3} | {:6} | {:8} | {} | {}", r.key_id, status, latency, label, r.error_message.as_deref().unwrap_or(""));
+                println!(
+                    "  {:3} | {:6} | {:8} | {} | {}",
+                    r.key_id,
+                    status,
+                    latency,
+                    label,
+                    r.error_message.as_deref().unwrap_or("")
+                );
             }
         }
     } else {
@@ -531,9 +624,19 @@ fn handle_health_check(
             println!("{}:", provider.display_name);
             for r in results {
                 let status = if r.is_healthy { "OK" } else { "FAIL" };
-                let latency = r.response_time_ms.map(|ms| format!("{}ms", ms)).unwrap_or_else(|| "-".to_string());
+                let latency = r
+                    .response_time_ms
+                    .map(|ms| format!("{}ms", ms))
+                    .unwrap_or_else(|| "-".to_string());
                 let label = r.key_label.as_deref().unwrap_or("unnamed");
-                println!("  {:3} | {:6} | {:8} | {} | {}", r.key_id, status, latency, label, r.error_message.as_deref().unwrap_or(""));
+                println!(
+                    "  {:3} | {:6} | {:8} | {} | {}",
+                    r.key_id,
+                    status,
+                    latency,
+                    label,
+                    r.error_message.as_deref().unwrap_or("")
+                );
             }
         }
     }
@@ -553,7 +656,10 @@ fn handle_health_status(
         return Ok(());
     }
 
-    println!("{:<16} {:<6} {:<8} {:<6} {:<8} {}", "Provider", "Key", "Active", "Errors", "Status", "Last Check");
+    println!(
+        "{:<16} {:<6} {:<8} {:<6} {:<8} Last Check",
+        "Provider", "Key", "Active", "Errors", "Status"
+    );
     println!("{}", "-".repeat(75));
     for s in statuses {
         let key_label = s.key_label.as_deref().unwrap_or("unnamed");
@@ -579,19 +685,113 @@ fn handle_health_status(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn handle_provider_add(
+    provider_service: &ProviderServiceType,
+    name: String,
+    display_name: String,
+    base_url: String,
+    model: Option<String>,
+    auth_header: String,
+    timeout_ms: i64,
+    requires_disable_traffic: bool,
+) -> Result<()> {
+    let provider = ccswitch_db::models::Provider {
+        id: 0,
+        name,
+        display_name,
+        base_url,
+        model,
+        auth_header,
+        timeout_ms,
+        requires_disable_traffic,
+        usage_endpoint: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let id = provider_service.add_provider(provider)?;
+    println!("Added provider id={}", id);
+    Ok(())
+}
+
+fn handle_provider_list(provider_service: &ProviderServiceType) -> Result<()> {
+    let providers = provider_service.list_providers()?;
+    if providers.is_empty() {
+        println!("No providers configured. Use 'ccswitch provider add' to add one.");
+        return Ok(());
+    }
+    println!(
+        "{:<12} {:<20} {:<30} {:<8} Model",
+        "Name", "Display", "Base URL", "Timeout"
+    );
+    println!("{}", "-".repeat(100));
+    for p in &providers {
+        let model = p.model.as_deref().unwrap_or("-");
+        println!(
+            "{:<12} {:<20} {:<30} {:<8} {}",
+            p.name,
+            truncate(&p.display_name, 20),
+            truncate(&p.base_url, 30),
+            p.timeout_ms,
+            model,
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_provider_edit(
+    provider_service: &ProviderServiceType,
+    name: String,
+    display_name: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    auth_header: Option<String>,
+    timeout_ms: Option<i64>,
+    requires_disable_traffic: Option<bool>,
+) -> Result<()> {
+    provider_service.update_provider(
+        &name,
+        display_name,
+        base_url,
+        model,
+        auth_header,
+        timeout_ms,
+        requires_disable_traffic,
+    )?;
+    println!("Updated provider: {}", name);
+    Ok(())
+}
+
+fn handle_provider_remove(provider_service: &ProviderServiceType, name: &str) -> Result<()> {
+    provider_service.remove_provider(name)?;
+    println!("Removed provider: {}", name);
+    Ok(())
+}
+
 fn format_cents(cents: i64) -> String {
     format!("${:.2}", cents as f64 / 100.0)
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len - 3])
+        format!("{}...", s.chars().take(max_len - 3).collect::<String>())
     }
 }
 
-/// Escape a string for safe use in shell export commands
+/// Mask an API key for display, showing only the last 4 characters
+fn mask_key(key: &str) -> String {
+    if key.len() > 8 {
+        format!("****{}", &key[key.len() - 4..])
+    } else {
+        "****".to_string()
+    }
+}
+
+/// Escape a string for safe use in shell export commands.
+/// Uses single quotes to prevent all shell interpretation ($, `, !, etc).
 fn shell_escape(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\\\""))
+    format!("'{}'", s.replace('\'', "'\\''"))
 }

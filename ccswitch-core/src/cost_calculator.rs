@@ -24,21 +24,24 @@ impl CostCalculator {
         Self
     }
 
-    /// Calculate cost given token counts and per-million pricing
-    pub fn calculate(
-        &self,
-        usage: &TokenUsage,
-        pricing: &Pricing,
-    ) -> CostBreakdown {
-        let prompt_cost = (usage.prompt_tokens as f64 / 1_000_000.0)
-            * pricing.input_price_cents_per_million as f64;
-        let completion_cost = (usage.completion_tokens as f64 / 1_000_000.0)
-            * pricing.output_price_cents_per_million as f64;
+    /// Calculate cost given token counts and per-million pricing.
+    /// Uses integer arithmetic to avoid floating-point rounding issues.
+    pub fn calculate(&self, usage: &TokenUsage, pricing: &Pricing) -> CostBreakdown {
+        // cost = tokens * price_per_million / 1_000_000
+        // Use i128 for intermediate to prevent overflow, then round-half-up
+        let prompt_cost = ((usage.prompt_tokens as i128
+            * pricing.input_price_cents_per_million as i128
+            + 500_000)
+            / 1_000_000) as i64;
+        let completion_cost = ((usage.completion_tokens as i128
+            * pricing.output_price_cents_per_million as i128
+            + 500_000)
+            / 1_000_000) as i64;
 
         CostBreakdown {
-            prompt_cost_cents: prompt_cost.round() as i64,
-            completion_cost_cents: completion_cost.round() as i64,
-            total_cost_cents: (prompt_cost + completion_cost).round() as i64,
+            prompt_cost_cents: prompt_cost,
+            completion_cost_cents: completion_cost,
+            total_cost_cents: prompt_cost + completion_cost,
         }
     }
 

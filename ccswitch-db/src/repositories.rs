@@ -30,12 +30,10 @@ impl SqliteProviderRepository {
 impl ProviderRepository for SqliteProviderRepository {
     fn list(&self) -> Result<Vec<Provider>> {
         let conn = self.pool.get()?;
-        let mut stmt = conn.prepare(
-            "SELECT * FROM providers ORDER BY name"
-        )?;
+        let mut stmt = conn.prepare("SELECT * FROM providers ORDER BY name")?;
 
         let providers = stmt
-            .query_map([], |row| Provider::from_row(row))?
+            .query_map([], Provider::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok(providers)
@@ -43,26 +41,18 @@ impl ProviderRepository for SqliteProviderRepository {
 
     fn get_by_id(&self, id: i64) -> Result<Option<Provider>> {
         let conn = self.pool.get()?;
-        let mut stmt = conn.prepare(
-            "SELECT * FROM providers WHERE id = ?1"
-        )?;
+        let mut stmt = conn.prepare("SELECT * FROM providers WHERE id = ?1")?;
 
-        let provider = stmt
-            .query_row([id], |row| Provider::from_row(row))
-            .optional()?;
+        let provider = stmt.query_row([id], Provider::from_row).optional()?;
 
         Ok(provider)
     }
 
     fn get_by_name(&self, name: &str) -> Result<Option<Provider>> {
         let conn = self.pool.get()?;
-        let mut stmt = conn.prepare(
-            "SELECT * FROM providers WHERE name = ?1"
-        )?;
+        let mut stmt = conn.prepare("SELECT * FROM providers WHERE name = ?1")?;
 
-        let provider = stmt
-            .query_row([name], |row| Provider::from_row(row))
-            .optional()?;
+        let provider = stmt.query_row([name], Provider::from_row).optional()?;
 
         Ok(provider)
     }
@@ -119,10 +109,7 @@ impl ProviderRepository for SqliteProviderRepository {
 
     fn delete(&self, id: i64) -> Result<()> {
         let conn = self.pool.get()?;
-        conn.execute(
-            "DELETE FROM providers WHERE id = ?1",
-            [id],
-        )?;
+        conn.execute("DELETE FROM providers WHERE id = ?1", [id])?;
 
         info!("Provider deleted: id={}", id);
         Ok(())
@@ -138,7 +125,12 @@ pub trait ApiKeyRepository {
     fn get_best_key_for_provider(&self, provider_id: i64) -> Result<Option<ApiKey>>;
     fn create(&self, key: &ApiKey) -> Result<i64>;
     fn update(&self, key: &ApiKey) -> Result<()>;
-    fn update_usage_stats(&self, key_id: i64, success: bool, error_message: Option<&str>) -> Result<()>;
+    fn update_usage_stats(
+        &self,
+        key_id: i64,
+        success: bool,
+        error_message: Option<&str>,
+    ) -> Result<()>;
     fn delete(&self, id: i64) -> Result<()>;
     fn count_by_provider(&self, provider_id: i64) -> Result<i64>;
 }
@@ -157,11 +149,11 @@ impl ApiKeyRepository for SqliteApiKeyRepository {
     fn list_by_provider(&self, provider_id: i64) -> Result<Vec<ApiKey>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
-            "SELECT * FROM api_keys WHERE provider_id = ?1 ORDER BY priority ASC, created_at DESC"
+            "SELECT * FROM api_keys WHERE provider_id = ?1 ORDER BY priority ASC, created_at DESC",
         )?;
 
         let keys = stmt
-            .query_map([provider_id], |row| ApiKey::from_row(row))?
+            .query_map([provider_id], ApiKey::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok(keys)
@@ -169,13 +161,9 @@ impl ApiKeyRepository for SqliteApiKeyRepository {
 
     fn get_by_id(&self, id: i64) -> Result<Option<ApiKey>> {
         let conn = self.pool.get()?;
-        let mut stmt = conn.prepare(
-            "SELECT * FROM api_keys WHERE id = ?1"
-        )?;
+        let mut stmt = conn.prepare("SELECT * FROM api_keys WHERE id = ?1")?;
 
-        let key = stmt
-            .query_row([id], |row| ApiKey::from_row(row))
-            .optional()?;
+        let key = stmt.query_row([id], ApiKey::from_row).optional()?;
 
         Ok(key)
     }
@@ -188,12 +176,10 @@ impl ApiKeyRepository for SqliteApiKeyRepository {
                AND is_active = 1
                AND (error_count < 3 OR last_error_at < datetime('now', '-24 hours'))
              ORDER BY priority ASC, error_count ASC, last_used_at ASC
-             LIMIT 1"
+             LIMIT 1",
         )?;
 
-        let key = stmt
-            .query_row([provider_id], |row| ApiKey::from_row(row))
-            .optional()?;
+        let key = stmt.query_row([provider_id], ApiKey::from_row).optional()?;
 
         Ok(key)
     }
@@ -215,7 +201,10 @@ impl ApiKeyRepository for SqliteApiKeyRepository {
         )?;
 
         let id = conn.last_insert_rowid();
-        info!("API key created: id={} for provider_id={}", id, key.provider_id);
+        info!(
+            "API key created: id={} for provider_id={}",
+            id, key.provider_id
+        );
         Ok(id)
     }
 
@@ -250,7 +239,12 @@ impl ApiKeyRepository for SqliteApiKeyRepository {
         Ok(())
     }
 
-    fn update_usage_stats(&self, key_id: i64, success: bool, _error_message: Option<&str>) -> Result<()> {
+    fn update_usage_stats(
+        &self,
+        key_id: i64,
+        success: bool,
+        _error_message: Option<&str>,
+    ) -> Result<()> {
         let conn = self.pool.get()?;
 
         if success {
@@ -277,10 +271,7 @@ impl ApiKeyRepository for SqliteApiKeyRepository {
 
     fn delete(&self, id: i64) -> Result<()> {
         let conn = self.pool.get()?;
-        conn.execute(
-            "DELETE FROM api_keys WHERE id = ?1",
-            [id],
-        )?;
+        conn.execute("DELETE FROM api_keys WHERE id = ?1", [id])?;
 
         info!("API key deleted: id={}", id);
         Ok(())
@@ -349,17 +340,18 @@ impl SettingsRepository for SqliteSettingsRepository {
     fn get_active_provider_id(&self) -> Result<Option<i64>> {
         let value = self.get("active_provider_id")?;
         match value {
-            Some(v) if v != "NULL" && !v.is_empty() => {
-                v.parse::<i64>()
-                    .map(Some)
-                    .context("Invalid active_provider_id")
-            }
+            Some(v) if v != "NULL" && !v.is_empty() => v
+                .parse::<i64>()
+                .map(Some)
+                .context("Invalid active_provider_id"),
             _ => Ok(None),
         }
     }
 
     fn set_active_provider_id(&self, provider_id: Option<i64>) -> Result<()> {
-        let value = provider_id.map(|id| id.to_string()).unwrap_or_else(|| "NULL".to_string());
+        let value = provider_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "NULL".to_string());
         self.set("active_provider_id", &value)
     }
 }
@@ -369,7 +361,11 @@ impl SettingsRepository for SqliteSettingsRepository {
 // ---------------------------------------------------------------------------
 pub trait UsageLogRepository {
     fn create(&self, log: &crate::models::UsageLog) -> Result<i64>;
-    fn list_by_provider(&self, provider_id: i64, limit: i64) -> Result<Vec<crate::models::UsageLog>>;
+    fn list_by_provider(
+        &self,
+        provider_id: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::models::UsageLog>>;
     fn list_recent(&self, limit: i64) -> Result<Vec<crate::models::UsageLog>>;
     fn daily_stats(&self, start_date: &str, end_date: &str) -> Result<Vec<DailyStat>>;
     fn provider_stats(&self, start_date: &str, end_date: &str) -> Result<Vec<ProviderStat>>;
@@ -416,24 +412,29 @@ impl UsageLogRepository for SqliteUsageLogRepository {
         Ok(id)
     }
 
-    fn list_by_provider(&self, provider_id: i64, limit: i64) -> Result<Vec<crate::models::UsageLog>> {
+    fn list_by_provider(
+        &self,
+        provider_id: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::models::UsageLog>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
-            "SELECT * FROM usage_logs WHERE provider_id = ?1 ORDER BY timestamp DESC LIMIT ?2"
+            "SELECT * FROM usage_logs WHERE provider_id = ?1 ORDER BY timestamp DESC LIMIT ?2",
         )?;
         let logs = stmt
-            .query_map(params![provider_id, limit], |row| crate::models::UsageLog::from_row(row))?
+            .query_map(
+                params![provider_id, limit],
+                crate::models::UsageLog::from_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(logs)
     }
 
     fn list_recent(&self, limit: i64) -> Result<Vec<crate::models::UsageLog>> {
         let conn = self.pool.get()?;
-        let mut stmt = conn.prepare(
-            "SELECT * FROM usage_logs ORDER BY timestamp DESC LIMIT ?1"
-        )?;
+        let mut stmt = conn.prepare("SELECT * FROM usage_logs ORDER BY timestamp DESC LIMIT ?1")?;
         let logs = stmt
-            .query_map([limit], |row| crate::models::UsageLog::from_row(row))?
+            .query_map([limit], crate::models::UsageLog::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(logs)
     }
@@ -451,7 +452,7 @@ impl UsageLogRepository for SqliteUsageLogRepository {
              FROM usage_logs
              WHERE date(timestamp) BETWEEN date(?1) AND date(?2)
              GROUP BY day
-             ORDER BY day DESC"
+             ORDER BY day DESC",
         )?;
         let stats = stmt
             .query_map(params![start_date, end_date], |row| {
@@ -480,7 +481,7 @@ impl UsageLogRepository for SqliteUsageLogRepository {
              JOIN providers p ON ul.provider_id = p.id
              WHERE date(ul.timestamp) BETWEEN date(?1) AND date(?2)
              GROUP BY p.name
-             ORDER BY cost_cents DESC"
+             ORDER BY cost_cents DESC",
         )?;
         let stats = stmt
             .query_map(params![start_date, end_date], |row| {
@@ -540,7 +541,11 @@ pub struct ProviderStat {
 // PricingRepository
 // ---------------------------------------------------------------------------
 pub trait PricingRepository {
-    fn get_current_for_model(&self, provider_id: i64, model: &str) -> Result<Option<crate::models::Pricing>>;
+    fn get_current_for_model(
+        &self,
+        provider_id: i64,
+        model: &str,
+    ) -> Result<Option<crate::models::Pricing>>;
     fn list_by_provider(&self, provider_id: i64) -> Result<Vec<crate::models::Pricing>>;
     fn upsert(&self, pricing: &crate::models::Pricing) -> Result<()>;
 }
@@ -556,16 +561,23 @@ impl SqlitePricingRepository {
 }
 
 impl PricingRepository for SqlitePricingRepository {
-    fn get_current_for_model(&self, provider_id: i64, model: &str) -> Result<Option<crate::models::Pricing>> {
+    fn get_current_for_model(
+        &self,
+        provider_id: i64,
+        model: &str,
+    ) -> Result<Option<crate::models::Pricing>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
             "SELECT * FROM pricing
              WHERE provider_id = ?1 AND model = ?2 AND is_current = 1
              ORDER BY effective_date DESC
-             LIMIT 1"
+             LIMIT 1",
         )?;
         let pricing = stmt
-            .query_row(params![provider_id, model], |row| crate::models::Pricing::from_row(row))
+            .query_row(
+                params![provider_id, model],
+                crate::models::Pricing::from_row,
+            )
             .optional()?;
         Ok(pricing)
     }
@@ -573,10 +585,10 @@ impl PricingRepository for SqlitePricingRepository {
     fn list_by_provider(&self, provider_id: i64) -> Result<Vec<crate::models::Pricing>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
-            "SELECT * FROM pricing WHERE provider_id = ?1 ORDER BY model, effective_date DESC"
+            "SELECT * FROM pricing WHERE provider_id = ?1 ORDER BY model, effective_date DESC",
         )?;
         let pricings = stmt
-            .query_map([provider_id], |row| crate::models::Pricing::from_row(row))?
+            .query_map([provider_id], crate::models::Pricing::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(pricings)
     }
@@ -642,21 +654,23 @@ impl HealthCheckRepository for SqliteHealthCheckRepository {
     fn list_recent(&self, api_key_id: i64, limit: i64) -> Result<Vec<crate::models::HealthCheck>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
-            "SELECT * FROM health_checks WHERE api_key_id = ?1 ORDER BY timestamp DESC LIMIT ?2"
+            "SELECT * FROM health_checks WHERE api_key_id = ?1 ORDER BY timestamp DESC LIMIT ?2",
         )?;
         let checks = stmt
-            .query_map(params![api_key_id, limit], |row| crate::models::HealthCheck::from_row(row))?
+            .query_map(
+                params![api_key_id, limit],
+                crate::models::HealthCheck::from_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(checks)
     }
 
     fn list_all_recent(&self, limit: i64) -> Result<Vec<crate::models::HealthCheck>> {
         let conn = self.pool.get()?;
-        let mut stmt = conn.prepare(
-            "SELECT * FROM health_checks ORDER BY timestamp DESC LIMIT ?1"
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT * FROM health_checks ORDER BY timestamp DESC LIMIT ?1")?;
         let checks = stmt
-            .query_map([limit], |row| crate::models::HealthCheck::from_row(row))?
+            .query_map([limit], crate::models::HealthCheck::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(checks)
     }
@@ -664,10 +678,10 @@ impl HealthCheckRepository for SqliteHealthCheckRepository {
     fn latest_for_key(&self, api_key_id: i64) -> Result<Option<crate::models::HealthCheck>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
-            "SELECT * FROM health_checks WHERE api_key_id = ?1 ORDER BY timestamp DESC LIMIT 1"
+            "SELECT * FROM health_checks WHERE api_key_id = ?1 ORDER BY timestamp DESC LIMIT 1",
         )?;
         let check = stmt
-            .query_row([api_key_id], |row| crate::models::HealthCheck::from_row(row))
+            .query_row([api_key_id], crate::models::HealthCheck::from_row)
             .optional()?;
         Ok(check)
     }

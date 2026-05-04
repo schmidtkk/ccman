@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
+use ccswitch_db::models::UsageLog;
+use ccswitch_db::repositories::{DailyStat, PricingRepository, ProviderStat, UsageLogRepository};
 use chrono::{Datelike, Local, NaiveDate};
 use serde_json::Value;
-use tracing::{info, warn};
 
-use ccswitch_db::models::UsageLog;
-use ccswitch_db::repositories::{UsageLogRepository, PricingRepository, DailyStat, ProviderStat};
-
-use crate::cost_calculator::{CostCalculator, CostBreakdown, TokenUsage};
+use crate::cost_calculator::{CostCalculator, TokenUsage};
 
 /// Tracks API usage: parses responses, calculates costs, and persists logs
 pub struct UsageTracker<U, P>
@@ -41,7 +39,8 @@ where
 
         let prompt_tokens = usage["prompt_tokens"].as_i64().unwrap_or(0);
         let completion_tokens = usage["completion_tokens"].as_i64().unwrap_or(0);
-        let total_tokens = usage["total_tokens"].as_i64()
+        let total_tokens = usage["total_tokens"]
+            .as_i64()
             .unwrap_or(prompt_tokens + completion_tokens);
 
         Ok(TokenUsage {
@@ -49,71 +48,6 @@ where
             completion_tokens,
             total_tokens,
         })
-    }
-
-    /// Record usage from a raw API response
-    pub fn record_from_response(
-        &self,
-        provider_id: i64,
-        api_key_id: Option<i64>,
-        model: &str,
-        response: &str,
-        request_id: Option<&str>,
-        success: bool,
-        error_message: Option<&str>,
-    ) -> Result<i64> {
-        let token_usage = if success {
-            match Self::parse_usage(response) {
-                Ok(u) => u,
-                Err(e) => {
-                    warn!("Failed to parse usage: {}", e);
-                    TokenUsage::default()
-                }
-            }
-        } else {
-            TokenUsage::default()
-        };
-
-        let cost = if success {
-            match self.pricing_repo.get_current_for_model(provider_id, model) {
-                Ok(Some(pricing)) => self.calculator.calculate(&token_usage, &pricing),
-                Ok(None) => {
-                    warn!("No pricing found for provider_id={}, model={}", provider_id, model);
-                    self.calculator.calculate_unknown(&token_usage)
-                }
-                Err(e) => {
-                    warn!("Failed to fetch pricing: {}", e);
-                    self.calculator.calculate_unknown(&token_usage)
-                }
-            }
-        } else {
-            CostBreakdown::default()
-        };
-
-        let log = UsageLog {
-            id: 0,
-            provider_id,
-            api_key_id,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            model: model.to_string(),
-            prompt_tokens: token_usage.prompt_tokens,
-            completion_tokens: token_usage.completion_tokens,
-            total_tokens: token_usage.total_tokens,
-            prompt_cost_cents: cost.prompt_cost_cents,
-            completion_cost_cents: cost.completion_cost_cents,
-            total_cost_cents: cost.total_cost_cents,
-            usage_json: Some(response.to_string()),
-            request_id: request_id.map(|s| s.to_string()),
-            success,
-            error_message: error_message.map(|s| s.to_string()),
-        };
-
-        let id = self.usage_repo.create(&log)?;
-        info!(
-            "Recorded usage id={} provider={} model={} tokens={} cost={}¢",
-            id, provider_id, model, token_usage.total_tokens, cost.total_cost_cents
-        );
-        Ok(id)
     }
 
     /// Manually log usage with known token counts
