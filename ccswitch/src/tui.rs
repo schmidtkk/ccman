@@ -84,6 +84,31 @@ enum InputMode {
         key_id: i64,
         key_label: String,
     },
+    AddProvider {
+        name: String,
+        display_name: String,
+        base_url: String,
+        model: String,
+        auth_header: String,
+        timeout_ms: String,
+        requires_disable_traffic: bool,
+        focused_field: usize,
+    },
+    EditProvider {
+        provider_id: i64,
+        name: String,
+        display_name: String,
+        base_url: String,
+        model: String,
+        auth_header: String,
+        timeout_ms: String,
+        requires_disable_traffic: bool,
+        focused_field: usize,
+    },
+    ConfirmDeleteProvider {
+        provider_id: i64,
+        provider_name: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +418,78 @@ impl App {
         self.refresh_tab_data()?;
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_add_provider(
+        &mut self,
+        name: String,
+        display_name: String,
+        base_url: String,
+        model: String,
+        auth_header: String,
+        timeout_ms: String,
+        requires_disable_traffic: bool,
+    ) -> Result<()> {
+        let provider = ccswitch_db::models::Provider {
+            id: 0,
+            name: name.clone(),
+            display_name: display_name.clone(),
+            base_url,
+            model: if model.is_empty() { None } else { Some(model) },
+            auth_header,
+            timeout_ms: timeout_ms.parse::<i64>().unwrap_or(60000),
+            requires_disable_traffic,
+            usage_endpoint: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let id = self.provider_service.add_provider(provider)?;
+        self.popup_message = Some(format!("Added provider {} (id={})", display_name, id));
+        self.refresh_tab_data()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_edit_provider(
+        &mut self,
+        provider_id: i64,
+        name: String,
+        display_name: String,
+        base_url: String,
+        model: String,
+        auth_header: String,
+        timeout_ms: String,
+        requires_disable_traffic: bool,
+    ) -> Result<()> {
+        let model_opt = if model.is_empty() { None } else { Some(model) };
+        let timeout = timeout_ms.parse::<i64>().unwrap_or(60000);
+        self.provider_service.update_provider(
+            &name,
+            Some(display_name.clone()),
+            Some(base_url),
+            model_opt,
+            Some(auth_header),
+            Some(timeout),
+            Some(requires_disable_traffic),
+        )?;
+        self.popup_message = Some(format!("Updated provider {}", display_name));
+        self.refresh_tab_data()?;
+        // Keep selection on the edited provider
+        if let Some(idx) = self.providers.iter().position(|p| p.id == provider_id) {
+            self.selected_provider = idx;
+        }
+        Ok(())
+    }
+
+    fn delete_selected_provider(&mut self, provider_id: i64) -> Result<()> {
+        if let Some(p) = self.providers.iter().find(|p| p.id == provider_id) {
+            let name = p.name.clone();
+            self.provider_service.remove_provider(&name)?;
+            self.popup_message = Some(format!("Removed provider {}", name));
+            self.refresh_tab_data()?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +522,77 @@ fn handle_events(app: &mut App) -> Result<()> {
                 let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
                 if let InputMode::ConfirmDelete { key_id, key_label } = mode {
                     app.input_mode = handle_confirm_delete_input(app, key.code, key_id, key_label)?;
+                }
+            }
+            InputMode::AddProvider { .. } => {
+                let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+                if let InputMode::AddProvider {
+                    name,
+                    display_name,
+                    base_url,
+                    model,
+                    auth_header,
+                    timeout_ms,
+                    requires_disable_traffic,
+                    focused_field,
+                } = mode
+                {
+                    app.input_mode = handle_add_provider_input(
+                        app,
+                        key.code,
+                        name,
+                        display_name,
+                        base_url,
+                        model,
+                        auth_header,
+                        timeout_ms,
+                        requires_disable_traffic,
+                        focused_field,
+                    )?;
+                }
+            }
+            InputMode::EditProvider { .. } => {
+                let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+                if let InputMode::EditProvider {
+                    provider_id,
+                    name,
+                    display_name,
+                    base_url,
+                    model,
+                    auth_header,
+                    timeout_ms,
+                    requires_disable_traffic,
+                    focused_field,
+                } = mode
+                {
+                    app.input_mode = handle_edit_provider_input(
+                        app,
+                        key.code,
+                        provider_id,
+                        name,
+                        display_name,
+                        base_url,
+                        model,
+                        auth_header,
+                        timeout_ms,
+                        requires_disable_traffic,
+                        focused_field,
+                    )?;
+                }
+            }
+            InputMode::ConfirmDeleteProvider { .. } => {
+                let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+                if let InputMode::ConfirmDeleteProvider {
+                    provider_id,
+                    provider_name,
+                } = mode
+                {
+                    app.input_mode = handle_confirm_delete_provider_input(
+                        app,
+                        key.code,
+                        provider_id,
+                        provider_name,
+                    )?;
                 }
             }
         },
@@ -535,6 +703,41 @@ fn handle_normal_key(app: &mut App, code: KeyCode) -> Result<()> {
                         .key_label
                         .clone()
                         .unwrap_or_else(|| format!("id={}", key.id)),
+                };
+            }
+        }
+        KeyCode::Char('a') if app.tab == Tab::Providers => {
+            app.input_mode = InputMode::AddProvider {
+                name: String::new(),
+                display_name: String::new(),
+                base_url: String::new(),
+                model: String::new(),
+                auth_header: "Authorization: Bearer".to_string(),
+                timeout_ms: "60000".to_string(),
+                requires_disable_traffic: false,
+                focused_field: 0,
+            };
+        }
+        KeyCode::Char('e') if app.tab == Tab::Providers && !app.providers.is_empty() => {
+            if let Some(p) = app.providers.get(app.selected_provider) {
+                app.input_mode = InputMode::EditProvider {
+                    provider_id: p.id,
+                    name: p.name.clone(),
+                    display_name: p.display_name.clone(),
+                    base_url: p.base_url.clone(),
+                    model: p.model.clone().unwrap_or_default(),
+                    auth_header: p.auth_header.clone(),
+                    timeout_ms: p.timeout_ms.to_string(),
+                    requires_disable_traffic: p.requires_disable_traffic,
+                    focused_field: 0,
+                };
+            }
+        }
+        KeyCode::Char('d') if app.tab == Tab::Providers && !app.providers.is_empty() => {
+            if let Some(p) = app.providers.get(app.selected_provider) {
+                app.input_mode = InputMode::ConfirmDeleteProvider {
+                    provider_id: p.id,
+                    provider_name: p.display_name.clone(),
                 };
             }
         }
@@ -651,6 +854,295 @@ fn handle_confirm_delete_input(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn handle_add_provider_input(
+    app: &mut App,
+    code: KeyCode,
+    mut name: String,
+    mut display_name: String,
+    mut base_url: String,
+    mut model: String,
+    mut auth_header: String,
+    mut timeout_ms: String,
+    mut requires_disable_traffic: bool,
+    focused_field: usize,
+) -> Result<InputMode> {
+    const FIELD_COUNT: usize = 7;
+    match code {
+        KeyCode::Esc => Ok(InputMode::Normal),
+        KeyCode::Tab => Ok(InputMode::AddProvider {
+            name,
+            display_name,
+            base_url,
+            model,
+            auth_header,
+            timeout_ms,
+            requires_disable_traffic,
+            focused_field: (focused_field + 1) % FIELD_COUNT,
+        }),
+        KeyCode::BackTab => Ok(InputMode::AddProvider {
+            name,
+            display_name,
+            base_url,
+            model,
+            auth_header,
+            timeout_ms,
+            requires_disable_traffic,
+            focused_field: (focused_field + FIELD_COUNT - 1) % FIELD_COUNT,
+        }),
+        KeyCode::Backspace => {
+            match focused_field {
+                0 => name.pop(),
+                1 => display_name.pop(),
+                2 => base_url.pop(),
+                3 => model.pop(),
+                4 => auth_header.pop(),
+                5 => timeout_ms.pop(),
+                6 => {
+                    requires_disable_traffic = false;
+                    None
+                }
+                _ => None,
+            };
+            Ok(InputMode::AddProvider {
+                name,
+                display_name,
+                base_url,
+                model,
+                auth_header,
+                timeout_ms,
+                requires_disable_traffic,
+                focused_field,
+            })
+        }
+        KeyCode::Enter => {
+            if focused_field < FIELD_COUNT - 1 {
+                Ok(InputMode::AddProvider {
+                    name,
+                    display_name,
+                    base_url,
+                    model,
+                    auth_header,
+                    timeout_ms,
+                    requires_disable_traffic,
+                    focused_field: focused_field + 1,
+                })
+            } else if !name.is_empty() && !display_name.is_empty() && !base_url.is_empty() {
+                let _ = app.submit_add_provider(
+                    name,
+                    display_name,
+                    base_url,
+                    model,
+                    auth_header,
+                    timeout_ms,
+                    requires_disable_traffic,
+                );
+                Ok(InputMode::Normal)
+            } else {
+                app.popup_message =
+                    Some("Name, Display Name, and Base URL are required".to_string());
+                Ok(InputMode::Normal)
+            }
+        }
+        KeyCode::Char(c) => {
+            match focused_field {
+                0 => name.push(c),
+                1 => display_name.push(c),
+                2 => base_url.push(c),
+                3 => model.push(c),
+                4 => auth_header.push(c),
+                5 if c.is_ascii_digit() => {
+                    timeout_ms.push(c);
+                }
+                5 => {}
+                6 => {
+                    requires_disable_traffic =
+                        matches!(c.to_ascii_lowercase(), 'y' | 't' | '1' | ' ');
+                }
+                _ => {}
+            }
+            Ok(InputMode::AddProvider {
+                name,
+                display_name,
+                base_url,
+                model,
+                auth_header,
+                timeout_ms,
+                requires_disable_traffic,
+                focused_field,
+            })
+        }
+        _ => Ok(InputMode::AddProvider {
+            name,
+            display_name,
+            base_url,
+            model,
+            auth_header,
+            timeout_ms,
+            requires_disable_traffic,
+            focused_field,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_edit_provider_input(
+    app: &mut App,
+    code: KeyCode,
+    provider_id: i64,
+    mut name: String,
+    mut display_name: String,
+    mut base_url: String,
+    mut model: String,
+    mut auth_header: String,
+    mut timeout_ms: String,
+    mut requires_disable_traffic: bool,
+    focused_field: usize,
+) -> Result<InputMode> {
+    const FIELD_COUNT: usize = 7;
+    match code {
+        KeyCode::Esc => Ok(InputMode::Normal),
+        KeyCode::Tab => Ok(InputMode::EditProvider {
+            provider_id,
+            name,
+            display_name,
+            base_url,
+            model,
+            auth_header,
+            timeout_ms,
+            requires_disable_traffic,
+            focused_field: (focused_field + 1) % FIELD_COUNT,
+        }),
+        KeyCode::BackTab => Ok(InputMode::EditProvider {
+            provider_id,
+            name,
+            display_name,
+            base_url,
+            model,
+            auth_header,
+            timeout_ms,
+            requires_disable_traffic,
+            focused_field: (focused_field + FIELD_COUNT - 1) % FIELD_COUNT,
+        }),
+        KeyCode::Backspace => {
+            match focused_field {
+                0 => name.pop(),
+                1 => display_name.pop(),
+                2 => base_url.pop(),
+                3 => model.pop(),
+                4 => auth_header.pop(),
+                5 => timeout_ms.pop(),
+                6 => {
+                    requires_disable_traffic = false;
+                    None
+                }
+                _ => None,
+            };
+            Ok(InputMode::EditProvider {
+                provider_id,
+                name,
+                display_name,
+                base_url,
+                model,
+                auth_header,
+                timeout_ms,
+                requires_disable_traffic,
+                focused_field,
+            })
+        }
+        KeyCode::Enter => {
+            if focused_field < FIELD_COUNT - 1 {
+                Ok(InputMode::EditProvider {
+                    provider_id,
+                    name,
+                    display_name,
+                    base_url,
+                    model,
+                    auth_header,
+                    timeout_ms,
+                    requires_disable_traffic,
+                    focused_field: focused_field + 1,
+                })
+            } else if !name.is_empty() && !display_name.is_empty() && !base_url.is_empty() {
+                let _ = app.submit_edit_provider(
+                    provider_id,
+                    name,
+                    display_name,
+                    base_url,
+                    model,
+                    auth_header,
+                    timeout_ms,
+                    requires_disable_traffic,
+                );
+                Ok(InputMode::Normal)
+            } else {
+                app.popup_message =
+                    Some("Name, Display Name, and Base URL are required".to_string());
+                Ok(InputMode::Normal)
+            }
+        }
+        KeyCode::Char(c) => {
+            match focused_field {
+                0 => name.push(c),
+                1 => display_name.push(c),
+                2 => base_url.push(c),
+                3 => model.push(c),
+                4 => auth_header.push(c),
+                5 if c.is_ascii_digit() => {
+                    timeout_ms.push(c);
+                }
+                5 => {}
+                6 => {
+                    requires_disable_traffic =
+                        matches!(c.to_ascii_lowercase(), 'y' | 't' | '1' | ' ');
+                }
+                _ => {}
+            }
+            Ok(InputMode::EditProvider {
+                provider_id,
+                name,
+                display_name,
+                base_url,
+                model,
+                auth_header,
+                timeout_ms,
+                requires_disable_traffic,
+                focused_field,
+            })
+        }
+        _ => Ok(InputMode::EditProvider {
+            provider_id,
+            name,
+            display_name,
+            base_url,
+            model,
+            auth_header,
+            timeout_ms,
+            requires_disable_traffic,
+            focused_field,
+        }),
+    }
+}
+
+fn handle_confirm_delete_provider_input(
+    app: &mut App,
+    code: KeyCode,
+    provider_id: i64,
+    _provider_name: String,
+) -> Result<InputMode> {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let _ = app.delete_selected_provider(provider_id);
+            Ok(InputMode::Normal)
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Ok(InputMode::Normal),
+        _ => Ok(InputMode::ConfirmDeleteProvider {
+            provider_id,
+            provider_name: _provider_name,
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mouse event handling
 // ---------------------------------------------------------------------------
@@ -678,74 +1170,238 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
         return;
     }
 
-    // Priority 2: AddKey form
-    if let InputMode::AddKey { .. } = &app.input_mode {
-        // Check form field clicks
-        if let Some(field_idx) = app.click_targets.hit_form_field(pos) {
-            let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
-            if let InputMode::AddKey {
-                key_value,
-                key_label,
-                key_priority,
-                ..
-            } = mode
-            {
-                app.input_mode = InputMode::AddKey {
+    // Priority 2: AddKey / AddProvider / EditProvider forms
+    match &app.input_mode {
+        InputMode::AddKey { .. } => {
+            if let Some(field_idx) = app.click_targets.hit_form_field(pos) {
+                let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+                if let InputMode::AddKey {
                     key_value,
                     key_label,
                     key_priority,
-                    focused_field: field_idx,
-                };
-            }
-            return;
-        }
-        // Check submit/cancel buttons
-        if let Some(name) = app.click_targets.hit_button(pos) {
-            match name {
-                "submit" => {
-                    let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
-                    if let InputMode::AddKey {
+                    ..
+                } = mode
+                {
+                    app.input_mode = InputMode::AddKey {
                         key_value,
                         key_label,
                         key_priority,
-                        ..
-                    } = mode
-                    {
-                        if !key_value.is_empty() {
-                            let _ = app.submit_add_key(key_value, key_label, key_priority);
-                        } else {
-                            app.popup_message = Some("Key value is required".to_string());
+                        focused_field: field_idx,
+                    };
+                }
+                return;
+            }
+            if let Some(name) = app.click_targets.hit_button(pos) {
+                match name {
+                    "submit" => {
+                        let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+                        if let InputMode::AddKey {
+                            key_value,
+                            key_label,
+                            key_priority,
+                            ..
+                        } = mode
+                        {
+                            if !key_value.is_empty() {
+                                let _ = app.submit_add_key(key_value, key_label, key_priority);
+                            } else {
+                                app.popup_message = Some("Key value is required".to_string());
+                            }
                         }
                     }
+                    "cancel" => {
+                        app.input_mode = InputMode::Normal;
+                    }
+                    _ => {}
                 }
-                "cancel" => {
-                    app.input_mode = InputMode::Normal;
-                }
-                _ => {}
+                return;
             }
             return;
         }
-        return;
+        InputMode::AddProvider { .. } => {
+            if let Some(field_idx) = app.click_targets.hit_form_field(pos) {
+                let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+                if let InputMode::AddProvider {
+                    name,
+                    display_name,
+                    base_url,
+                    model,
+                    auth_header,
+                    timeout_ms,
+                    requires_disable_traffic,
+                    ..
+                } = mode
+                {
+                    app.input_mode = InputMode::AddProvider {
+                        name,
+                        display_name,
+                        base_url,
+                        model,
+                        auth_header,
+                        timeout_ms,
+                        requires_disable_traffic,
+                        focused_field: field_idx,
+                    };
+                }
+                return;
+            }
+            if let Some(name) = app.click_targets.hit_button(pos) {
+                match name {
+                    "submit" => {
+                        let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+                        if let InputMode::AddProvider {
+                            name,
+                            display_name,
+                            base_url,
+                            model,
+                            auth_header,
+                            timeout_ms,
+                            requires_disable_traffic,
+                            ..
+                        } = mode
+                        {
+                            if !name.is_empty() && !display_name.is_empty() && !base_url.is_empty()
+                            {
+                                let _ = app.submit_add_provider(
+                                    name,
+                                    display_name,
+                                    base_url,
+                                    model,
+                                    auth_header,
+                                    timeout_ms,
+                                    requires_disable_traffic,
+                                );
+                            } else {
+                                app.popup_message = Some(
+                                    "Name, Display Name, and Base URL are required".to_string(),
+                                );
+                            }
+                        }
+                    }
+                    "cancel" => {
+                        app.input_mode = InputMode::Normal;
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            return;
+        }
+        InputMode::EditProvider { .. } => {
+            if let Some(field_idx) = app.click_targets.hit_form_field(pos) {
+                let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+                if let InputMode::EditProvider {
+                    provider_id,
+                    name,
+                    display_name,
+                    base_url,
+                    model,
+                    auth_header,
+                    timeout_ms,
+                    requires_disable_traffic,
+                    ..
+                } = mode
+                {
+                    app.input_mode = InputMode::EditProvider {
+                        provider_id,
+                        name,
+                        display_name,
+                        base_url,
+                        model,
+                        auth_header,
+                        timeout_ms,
+                        requires_disable_traffic,
+                        focused_field: field_idx,
+                    };
+                }
+                return;
+            }
+            if let Some(name) = app.click_targets.hit_button(pos) {
+                match name {
+                    "submit" => {
+                        let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+                        if let InputMode::EditProvider {
+                            provider_id,
+                            name,
+                            display_name,
+                            base_url,
+                            model,
+                            auth_header,
+                            timeout_ms,
+                            requires_disable_traffic,
+                            ..
+                        } = mode
+                        {
+                            if !name.is_empty() && !display_name.is_empty() && !base_url.is_empty()
+                            {
+                                let _ = app.submit_edit_provider(
+                                    provider_id,
+                                    name,
+                                    display_name,
+                                    base_url,
+                                    model,
+                                    auth_header,
+                                    timeout_ms,
+                                    requires_disable_traffic,
+                                );
+                            } else {
+                                app.popup_message = Some(
+                                    "Name, Display Name, and Base URL are required".to_string(),
+                                );
+                            }
+                        }
+                    }
+                    "cancel" => {
+                        app.input_mode = InputMode::Normal;
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            return;
+        }
+        _ => {}
     }
 
-    // Priority 3: ConfirmDelete dialog
-    if let InputMode::ConfirmDelete { .. } = &app.input_mode {
-        if let Some(name) = app.click_targets.hit_confirm_button(pos) {
-            match name {
-                "yes" => {
-                    let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
-                    if let InputMode::ConfirmDelete { key_id, .. } = mode {
-                        let _ = app.delete_selected_key(key_id);
+    // Priority 3: ConfirmDelete / ConfirmDeleteProvider dialog
+    match &app.input_mode {
+        InputMode::ConfirmDelete { .. } => {
+            if let Some(name) = app.click_targets.hit_confirm_button(pos) {
+                match name {
+                    "yes" => {
+                        let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+                        if let InputMode::ConfirmDelete { key_id, .. } = mode {
+                            let _ = app.delete_selected_key(key_id);
+                        }
                     }
+                    "no" => {
+                        app.input_mode = InputMode::Normal;
+                    }
+                    _ => {}
                 }
-                "no" => {
-                    app.input_mode = InputMode::Normal;
-                }
-                _ => {}
+                return;
             }
             return;
         }
-        return;
+        InputMode::ConfirmDeleteProvider { .. } => {
+            if let Some(name) = app.click_targets.hit_confirm_button(pos) {
+                match name {
+                    "yes" => {
+                        let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+                        if let InputMode::ConfirmDeleteProvider { provider_id, .. } = mode {
+                            let _ = app.delete_selected_provider(provider_id);
+                        }
+                    }
+                    "no" => {
+                        app.input_mode = InputMode::Normal;
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            return;
+        }
+        _ => {}
     }
 
     // Priority 4: Normal mode — tabs, buttons, content
@@ -809,6 +1465,41 @@ fn handle_button_click(app: &mut App, name: &str) {
         "switch" if app.tab == Tab::Providers => {
             let _ = app.switch_provider();
             let _ = app.refresh_tab_data();
+        }
+        "add_provider" if app.tab == Tab::Providers => {
+            app.input_mode = InputMode::AddProvider {
+                name: String::new(),
+                display_name: String::new(),
+                base_url: String::new(),
+                model: String::new(),
+                auth_header: "Authorization: Bearer".to_string(),
+                timeout_ms: "60000".to_string(),
+                requires_disable_traffic: false,
+                focused_field: 0,
+            };
+        }
+        "edit_provider" if app.tab == Tab::Providers && !app.providers.is_empty() => {
+            if let Some(p) = app.providers.get(app.selected_provider) {
+                app.input_mode = InputMode::EditProvider {
+                    provider_id: p.id,
+                    name: p.name.clone(),
+                    display_name: p.display_name.clone(),
+                    base_url: p.base_url.clone(),
+                    model: p.model.clone().unwrap_or_default(),
+                    auth_header: p.auth_header.clone(),
+                    timeout_ms: p.timeout_ms.to_string(),
+                    requires_disable_traffic: p.requires_disable_traffic,
+                    focused_field: 0,
+                };
+            }
+        }
+        "delete_provider" if app.tab == Tab::Providers && !app.providers.is_empty() => {
+            if let Some(p) = app.providers.get(app.selected_provider) {
+                app.input_mode = InputMode::ConfirmDeleteProvider {
+                    provider_id: p.id,
+                    provider_name: p.display_name.clone(),
+                };
+            }
         }
         "check" if app.tab == Tab::Health => {
             let _ = app.run_health_check();
@@ -911,6 +1602,61 @@ fn ui(frame: &mut Frame, app: &mut App) {
         InputMode::ConfirmDelete { key_id, key_label } => {
             render_confirm_delete(frame, app, *key_id, key_label);
         }
+        InputMode::AddProvider {
+            name,
+            display_name,
+            base_url,
+            model,
+            auth_header,
+            timeout_ms,
+            requires_disable_traffic,
+            focused_field,
+        } => {
+            render_provider_form(
+                frame,
+                app,
+                "Add Provider",
+                name,
+                display_name,
+                base_url,
+                model,
+                auth_header,
+                timeout_ms,
+                *requires_disable_traffic,
+                *focused_field,
+            );
+        }
+        InputMode::EditProvider {
+            provider_id: _,
+            name,
+            display_name,
+            base_url,
+            model,
+            auth_header,
+            timeout_ms,
+            requires_disable_traffic,
+            focused_field,
+        } => {
+            render_provider_form(
+                frame,
+                app,
+                "Edit Provider",
+                name,
+                display_name,
+                base_url,
+                model,
+                auth_header,
+                timeout_ms,
+                *requires_disable_traffic,
+                *focused_field,
+            );
+        }
+        InputMode::ConfirmDeleteProvider {
+            provider_id,
+            provider_name,
+        } => {
+            render_confirm_delete_provider(frame, app, *provider_id, provider_name);
+        }
     }
 }
 
@@ -1000,10 +1746,29 @@ fn render_footer(frame: &mut Frame, app: &mut App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ));
                 spans.push(Span::raw(" switch pane"));
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    "a/d",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(" add/del"));
+            } else if app.tab == Tab::Providers {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    "a/e/d",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(" add/edit/del"));
             }
             Line::from(spans)
         }
-        InputMode::AddKey { .. } => Line::from(vec![
+        InputMode::AddKey { .. }
+        | InputMode::AddProvider { .. }
+        | InputMode::EditProvider { .. } => Line::from(vec![
             Span::styled(
                 "Tab",
                 Style::default()
@@ -1027,23 +1792,25 @@ fn render_footer(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::raw(" cancel  "),
             Span::raw("(or click fields & buttons)"),
         ]),
-        InputMode::ConfirmDelete { .. } => Line::from(vec![
-            Span::styled(
-                "y",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" confirm  "),
-            Span::styled(
-                "n/Esc",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" cancel  "),
-            Span::raw("(or click buttons)"),
-        ]),
+        InputMode::ConfirmDelete { .. } | InputMode::ConfirmDeleteProvider { .. } => {
+            Line::from(vec![
+                Span::styled(
+                    "y",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" confirm  "),
+                Span::styled(
+                    "n/Esc",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" cancel  "),
+                Span::raw("(or click buttons)"),
+            ])
+        }
     };
     frame.render_widget(Paragraph::new(help).alignment(Alignment::Center), layout[0]);
 
@@ -1055,7 +1822,7 @@ fn render_footer(frame: &mut Frame, app: &mut App, area: Rect) {
     ];
     let tab_button_count = match app.tab {
         Tab::Keys => 2,      // Add Key, Delete
-        Tab::Providers => 1, // Switch
+        Tab::Providers => 3, // Switch, Add, Edit, Remove
         Tab::Health => 1,    // Check
         Tab::Usage => 0,
     };
@@ -1077,6 +1844,18 @@ fn render_footer(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         Tab::Providers => {
             render_button(frame, app, "switch", " Switch ", btn_layout[btn_idx]);
+            btn_idx += 1;
+            render_button(frame, app, "add_provider", " + Add ", btn_layout[btn_idx]);
+            btn_idx += 1;
+            render_button(frame, app, "edit_provider", " Edit ", btn_layout[btn_idx]);
+            btn_idx += 1;
+            render_button(
+                frame,
+                app,
+                "delete_provider",
+                " Remove ",
+                btn_layout[btn_idx],
+            );
         }
         Tab::Health => {
             render_button(frame, app, "check", " Check ", btn_layout[btn_idx]);
@@ -1692,6 +2471,183 @@ fn render_confirm_delete(frame: &mut Frame, app: &mut App, key_id: i64, key_labe
         .push(("yes".to_string(), btn_layout[0]));
 
     // [No] button
+    let no_style = Style::default().bg(Color::DarkGray).fg(Color::White);
+    let no_btn = Paragraph::new(" No ")
+        .style(no_style)
+        .alignment(Alignment::Center);
+    frame.render_widget(no_btn, btn_layout[2]);
+    app.click_targets
+        .confirm_buttons
+        .push(("no".to_string(), btn_layout[2]));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_provider_form(
+    frame: &mut Frame,
+    app: &mut App,
+    title: &str,
+    name: &str,
+    display_name: &str,
+    base_url: &str,
+    model: &str,
+    auth_header: &str,
+    timeout_ms: &str,
+    requires_disable_traffic: bool,
+    focused_field: usize,
+) {
+    let area = frame.area();
+    let popup_area = centered_rect(70, 60, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let fields_layout = Layout::new(
+        Direction::Vertical,
+        [
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ],
+    )
+    .split(inner);
+
+    let fields = [
+        ("Name *", name, 0),
+        ("Display Name *", display_name, 1),
+        ("Base URL *", base_url, 2),
+        ("Model", model, 3),
+        ("Auth Header", auth_header, 4),
+        ("Timeout (ms)", timeout_ms, 5),
+        (
+            "Disable Traffic",
+            if requires_disable_traffic {
+                "yes"
+            } else {
+                "no"
+            },
+            6,
+        ),
+    ];
+
+    for (label, value, idx) in &fields {
+        let is_focused = *idx == focused_field;
+
+        let border_style = if is_focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let input_block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", label))
+            .border_style(border_style);
+
+        let input_inner = input_block.inner(fields_layout[*idx]);
+        frame.render_widget(input_block, fields_layout[*idx]);
+
+        let text_style = if is_focused {
+            Style::default().fg(Color::White).bg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        let display = if value.is_empty() && is_focused {
+            "_"
+        } else {
+            value
+        };
+
+        let paragraph = Paragraph::new(display).style(text_style);
+        frame.render_widget(paragraph, input_inner);
+
+        app.click_targets
+            .form_fields
+            .push((*idx, fields_layout[*idx]));
+    }
+
+    let btn_layout = Layout::new(
+        Direction::Horizontal,
+        [
+            Constraint::Length(12),
+            Constraint::Length(4),
+            Constraint::Length(12),
+        ],
+    )
+    .split(fields_layout[8]);
+
+    render_button(frame, app, "submit", " Submit ", btn_layout[0]);
+    render_button(frame, app, "cancel", " Cancel ", btn_layout[2]);
+}
+
+fn render_confirm_delete_provider(
+    frame: &mut Frame,
+    app: &mut App,
+    provider_id: i64,
+    provider_name: &str,
+) {
+    let area = frame.area();
+    let popup_area = centered_rect(50, 30, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title("Confirm Delete");
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let layout = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(2), Constraint::Length(3)],
+    )
+    .split(inner);
+
+    let msg = Paragraph::new(format!(
+        "Delete provider {} (id={})?",
+        provider_name, provider_id
+    ))
+    .alignment(Alignment::Center)
+    .wrap(ratatui::widgets::Wrap { trim: true });
+    frame.render_widget(msg, layout[0]);
+
+    let btn_layout = Layout::new(
+        Direction::Horizontal,
+        [
+            Constraint::Length(10),
+            Constraint::Length(4),
+            Constraint::Length(10),
+        ],
+    )
+    .split(layout[1]);
+
+    let yes_style = Style::default()
+        .bg(Color::Red)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let yes_btn = Paragraph::new(" Yes ")
+        .style(yes_style)
+        .alignment(Alignment::Center);
+    frame.render_widget(yes_btn, btn_layout[0]);
+    app.click_targets
+        .confirm_buttons
+        .push(("yes".to_string(), btn_layout[0]));
+
     let no_style = Style::default().bg(Color::DarkGray).fg(Color::White);
     let no_btn = Paragraph::new(" No ")
         .style(no_style)
