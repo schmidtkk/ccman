@@ -51,10 +51,12 @@ where
             format!("{}/v1/models", provider.base_url.trim_end_matches('/'))
         };
 
+        let (header_name, header_value) = parse_auth_header(&provider.auth_header, &key.key_value);
+
         let response = self
             .client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", key.key_value))
+            .header(&header_name, &header_value)
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .send();
 
@@ -115,11 +117,7 @@ where
 
             // Update key error count if unhealthy
             if !check_result.is_healthy {
-                self.api_key_repo.update_usage_stats(
-                    key.id,
-                    false,
-                    check_result.error_message.as_deref(),
-                )?;
+                self.api_key_repo.update_usage_stats(key.id, false)?;
                 warn!(
                     "Key {} for provider {} is unhealthy: {:?}",
                     key.id, provider_name, check_result.error_message
@@ -218,4 +216,43 @@ pub struct KeyHealthStatus {
     pub is_active: bool,
     pub error_count: i32,
     pub latest_check: Option<HealthCheck>,
+}
+
+/// Parse a provider's auth_header into (header_name, header_value_with_key).
+///
+/// `auth_header` is stored as e.g. `"Authorization: Bearer"` or `"X-Api-Key"`.
+/// - `"Authorization: Bearer"` → `("Authorization", "Bearer {key}")`
+/// - `"X-Api-Key"`            → `("X-Api-Key", "{key}")`
+fn parse_auth_header(auth_header: &str, key_value: &str) -> (String, String) {
+    match auth_header.split_once(':') {
+        Some((name, template)) => {
+            let name = name.trim().to_string();
+            let template = template.trim();
+            if template.contains("Bearer") {
+                (name, format!("Bearer {}", key_value))
+            } else {
+                (name, format!("{} {}", template, key_value))
+            }
+        }
+        None => (auth_header.to_string(), key_value.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_auth_header_bearer() {
+        let (name, value) = parse_auth_header("Authorization: Bearer", "sk-abc123");
+        assert_eq!(name, "Authorization");
+        assert_eq!(value, "Bearer sk-abc123");
+    }
+
+    #[test]
+    fn test_parse_auth_header_api_key() {
+        let (name, value) = parse_auth_header("X-Api-Key", "key-xyz");
+        assert_eq!(name, "X-Api-Key");
+        assert_eq!(value, "key-xyz");
+    }
 }

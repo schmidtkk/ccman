@@ -125,12 +125,7 @@ pub trait ApiKeyRepository {
     fn get_best_key_for_provider(&self, provider_id: i64) -> Result<Option<ApiKey>>;
     fn create(&self, key: &ApiKey) -> Result<i64>;
     fn update(&self, key: &ApiKey) -> Result<()>;
-    fn update_usage_stats(
-        &self,
-        key_id: i64,
-        success: bool,
-        error_message: Option<&str>,
-    ) -> Result<()>;
+    fn update_usage_stats(&self, key_id: i64, success: bool) -> Result<()>;
     fn delete(&self, id: i64) -> Result<()>;
     fn count_by_provider(&self, provider_id: i64) -> Result<i64>;
 }
@@ -239,12 +234,7 @@ impl ApiKeyRepository for SqliteApiKeyRepository {
         Ok(())
     }
 
-    fn update_usage_stats(
-        &self,
-        key_id: i64,
-        success: bool,
-        _error_message: Option<&str>,
-    ) -> Result<()> {
+    fn update_usage_stats(&self, key_id: i64, success: bool) -> Result<()> {
         let conn = self.pool.get()?;
 
         if success {

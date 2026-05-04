@@ -190,7 +190,7 @@ where
             .set_active_provider_id(Some(provider.id))?;
 
         // Update key usage stats
-        self.api_key_repo.update_usage_stats(key.id, true, None)?;
+        self.api_key_repo.update_usage_stats(key.id, true)?;
 
         info!(
             "Switched to provider: {} using key: {}",

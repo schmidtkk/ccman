@@ -13,7 +13,7 @@ if [[ -f "$_CCSWITCH_DIR/.env" ]]; then
 fi
 
 # ── Binary path ──────────────────────────────────────────────────────────────
-_CCSWITCH_BIN="${CCSWITCH_BIN:-$HOME/workspace/ccswitch/target/release/ccswitch}"
+_CCSWITCH_BIN="${CCSWITCH_BIN:-$_CCSWITCH_DIR/target/release/ccswitch}"
 
 # ── Helper: run binary and eval export/unset for current shell ───────────────
 _ccswitch_run() {
@@ -62,4 +62,3 @@ zz()    { _ccswitch_run use zz; }
 minimax() { _ccswitch_run use minimax; }
 cc()    { _ccswitch_run use cc; }
 model() { _ccswitch_run status; }
-alias ccsp='gtz && claude --dangerously-skip-permissions'
