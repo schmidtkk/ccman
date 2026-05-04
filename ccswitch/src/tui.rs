@@ -1822,7 +1822,7 @@ fn render_footer(frame: &mut Frame, app: &mut App, area: Rect) {
     ];
     let tab_button_count = match app.tab {
         Tab::Keys => 2,      // Add Key, Delete
-        Tab::Providers => 3, // Switch, Add, Edit, Remove
+        Tab::Providers => 4, // Switch, Add, Edit, Remove
         Tab::Health => 1,    // Check
         Tab::Usage => 0,
     };
