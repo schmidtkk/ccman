@@ -48,6 +48,12 @@ pub enum Commands {
         command: ProviderCommands,
     },
 
+    /// API speed benchmark
+    Bench {
+        #[command(subcommand)]
+        command: BenchCommands,
+    },
+
     /// Launch interactive TUI
     Tui,
 }
@@ -219,5 +225,22 @@ pub enum ProviderCommands {
     Remove {
         /// Provider name
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BenchCommands {
+    /// Run API speed benchmark
+    Run {
+        /// Provider name (optional, benchmarks all if omitted)
+        provider: Option<String>,
+
+        /// Number of rounds per provider
+        #[arg(short, long, default_value = "3")]
+        rounds: usize,
+
+        /// Custom prompt for benchmarking
+        #[arg(short, long)]
+        prompt: Option<String>,
     },
 }

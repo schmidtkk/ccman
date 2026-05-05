@@ -1,3 +1,4 @@
+pub mod benchmark;
 pub mod cost_calculator;
 pub mod health_check;
 pub mod provider;

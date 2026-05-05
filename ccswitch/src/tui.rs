@@ -13,7 +13,12 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io::stdout;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use ccswitch_core::benchmark::{BenchmarkService, ProviderBenchResult};
 use ccswitch_core::health_check::{HealthCheckService, KeyHealthStatus};
 use ccswitch_core::provider::ProviderService;
 use ccswitch_core::settings::SettingsManager;
@@ -35,6 +40,7 @@ enum Tab {
     Keys,
     Usage,
     Health,
+    Bench,
 }
 
 impl Tab {
@@ -44,6 +50,7 @@ impl Tab {
             Tab::Keys => "Keys",
             Tab::Usage => "Usage",
             Tab::Health => "Health",
+            Tab::Bench => "Bench",
         }
     }
 
@@ -52,20 +59,22 @@ impl Tab {
             Tab::Providers => Tab::Keys,
             Tab::Keys => Tab::Usage,
             Tab::Usage => Tab::Health,
-            Tab::Health => Tab::Providers,
+            Tab::Health => Tab::Bench,
+            Tab::Bench => Tab::Providers,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            Tab::Providers => Tab::Health,
+            Tab::Providers => Tab::Bench,
             Tab::Keys => Tab::Providers,
             Tab::Usage => Tab::Keys,
             Tab::Health => Tab::Usage,
+            Tab::Bench => Tab::Health,
         }
     }
 
-    const ALL: [Tab; 4] = [Tab::Providers, Tab::Keys, Tab::Usage, Tab::Health];
+    const ALL: [Tab; 5] = [Tab::Providers, Tab::Keys, Tab::Usage, Tab::Health, Tab::Bench];
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +118,9 @@ enum InputMode {
         provider_id: i64,
         provider_name: String,
     },
+    BenchPrompt {
+        prompt: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +145,7 @@ struct ClickTargets {
     form_fields: Vec<(usize, Rect)>,
     keys_provider_rows: Vec<(usize, Rect)>,
     confirm_buttons: Vec<(String, Rect)>,
+    bench_rows: Vec<(usize, Rect)>,
 }
 
 impl ClickTargets {
@@ -145,6 +158,7 @@ impl ClickTargets {
         self.form_fields.clear();
         self.keys_provider_rows.clear();
         self.confirm_buttons.clear();
+        self.bench_rows.clear();
     }
 
     fn hit_button(&self, pos: Position) -> Option<&str> {
@@ -192,6 +206,15 @@ impl ClickTargets {
         None
     }
 
+    fn hit_bench_row(&self, pos: Position) -> Option<usize> {
+        for (idx, rect) in &self.bench_rows {
+            if rect.contains(pos) {
+                return Some(*idx);
+            }
+        }
+        None
+    }
+
     fn hit_form_field(&self, pos: Position) -> Option<usize> {
         for (idx, rect) in &self.form_fields {
             if rect.contains(pos) {
@@ -231,6 +254,18 @@ pub struct App {
 
     health_status: Vec<KeyHealthStatus>,
 
+    bench_results: Vec<ProviderBenchResult>,
+    bench_running: bool,
+    bench_prompt: String,
+    bench_selected: usize,
+    bench_rx: Option<mpsc::Receiver<(Vec<ProviderBenchResult>, Option<String>)>>,
+    bench_started_at: Option<Instant>,
+    bench_cancel: Arc<AtomicBool>,
+    bench_cancelled: bool,
+    bench_last_run: Option<String>,
+    bench_detail: Option<String>,
+    bench_current_provider: Option<String>,
+
     popup_message: Option<String>,
     should_quit: bool,
     input_mode: InputMode,
@@ -246,6 +281,7 @@ pub struct App {
         SqliteApiKeyRepository,
         SqliteHealthCheckRepository,
     >,
+    pool: DatabasePool,
 }
 
 impl App {
@@ -287,6 +323,17 @@ impl App {
             usage_daily: Vec::new(),
             usage_provider: Vec::new(),
             health_status: Vec::new(),
+            bench_results: Vec::new(),
+            bench_running: false,
+            bench_prompt: ccswitch_core::benchmark::default_prompt().to_string(),
+            bench_selected: 0,
+            bench_rx: None,
+            bench_started_at: None,
+            bench_cancel: Arc::new(AtomicBool::new(false)),
+            bench_cancelled: false,
+            bench_last_run: None,
+            bench_detail: None,
+            bench_current_provider: None,
             popup_message: None,
             should_quit: false,
             input_mode: InputMode::Normal,
@@ -295,6 +342,7 @@ impl App {
             settings_manager,
             usage_tracker,
             health_service,
+            pool,
         })
     }
 
@@ -359,6 +407,9 @@ impl App {
             Tab::Health => {
                 self.health_status = self.health_service.latest_status()?;
             }
+            Tab::Bench => {
+                // Results persist in memory; no refresh needed
+            }
         }
         Ok(())
     }
@@ -388,6 +439,117 @@ impl App {
             ));
         }
         Ok(())
+    }
+
+    fn run_benchmark(&mut self, provider_idx: Option<usize>) -> Result<()> {
+        if self.bench_running {
+            self.popup_message = Some("Benchmark already running...".to_string());
+            return Ok(());
+        }
+
+        self.bench_cancel.store(false, Ordering::SeqCst);
+        self.bench_cancelled = false;
+
+        let prompt = self.bench_prompt.clone();
+        let max_tokens = ccswitch_core::benchmark::default_max_tokens();
+        let rounds = ccswitch_core::benchmark::default_rounds();
+        let pool = self.pool.clone();
+        let cancel = Arc::clone(&self.bench_cancel);
+
+        let (tx, rx) = mpsc::channel::<(Vec<ProviderBenchResult>, Option<String>)>();
+
+        if let Some(idx) = provider_idx {
+            let provider_name = self.bench_results.get(idx).map(|r| r.provider_name.clone());
+            if let Some(name) = provider_name {
+                let name_clone = name.clone();
+                thread::spawn(move || {
+                    let provider_repo = SqliteProviderRepository::new(pool.clone());
+                    let api_key_repo = SqliteApiKeyRepository::new(pool.clone());
+                    let svc = BenchmarkService::new(provider_repo, api_key_repo);
+
+                    let _ = tx.send((Vec::new(), Some(name_clone.clone())));
+                    let result = svc.bench_provider(&name_clone, &prompt, max_tokens, rounds);
+                    let results = match result {
+                        Ok(r) => vec![r],
+                        Err(_) => Vec::new(),
+                    };
+                    let _ = tx.send((results, None));
+                });
+            }
+        } else {
+            thread::spawn(move || {
+                let provider_repo = SqliteProviderRepository::new(pool.clone());
+                let api_key_repo = SqliteApiKeyRepository::new(pool.clone());
+                let svc = BenchmarkService::new(provider_repo, api_key_repo);
+
+                let outcome = svc.bench_all_with_cancel(&prompt, max_tokens, rounds, Some(&*cancel));
+                let mut accumulated = Vec::new();
+                if let Ok(results) = outcome {
+                    accumulated = results;
+                }
+                let _ = tx.send((accumulated, None));
+            });
+        }
+
+        self.bench_rx = Some(rx);
+        self.bench_running = true;
+        self.bench_started_at = Some(Instant::now());
+        self.popup_message = Some("Benchmark started...".to_string());
+        Ok(())
+    }
+
+    /// Drain the bench result channel; called from the event loop.
+    fn poll_bench_results(&mut self) {
+        let Some(rx) = self.bench_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((mut results, current)) => {
+                if current.is_none() {
+                    results.sort_by(|a, b| {
+                        let a_ok = a.success_count() > 0;
+                        let b_ok = b.success_count() > 0;
+                        match (a_ok, b_ok) {
+                            (true, true) => a
+                                .avg_total_ms()
+                                .partial_cmp(&b.avg_total_ms())
+                                .unwrap_or(std::cmp::Ordering::Equal),
+                            (true, false) => std::cmp::Ordering::Less,
+                            (false, true) => std::cmp::Ordering::Greater,
+                            (false, false) => std::cmp::Ordering::Equal,
+                        }
+                    });
+                    self.bench_results = results;
+                    self.bench_selected = 0;
+                    self.bench_running = false;
+                    self.bench_rx = None;
+                    self.bench_current_provider = None;
+                    self.bench_last_run = Some(chrono::Local::now().format("%H:%M:%S").to_string());
+                    let elapsed = self
+                        .bench_started_at
+                        .take()
+                        .map(|t| t.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
+                    if self.bench_cancelled {
+                        self.popup_message = Some(format!("Benchmark cancelled after {:.1}s", elapsed));
+                    } else {
+                        self.popup_message = Some(format!("Benchmark completed in {:.1}s", elapsed));
+                    }
+                } else {
+                    self.bench_results = results;
+                    self.bench_current_provider = current;
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.bench_running = false;
+                self.bench_rx = None;
+                self.bench_started_at = None;
+                self.bench_current_provider = None;
+                self.popup_message =
+                    Some("Benchmark thread disconnected unexpectedly".to_string());
+            }
+        }
     }
 
     fn submit_add_key(
@@ -595,6 +757,12 @@ fn handle_events(app: &mut App) -> Result<()> {
                     )?;
                 }
             }
+            InputMode::BenchPrompt { .. } => {
+                let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+                if let InputMode::BenchPrompt { prompt } = mode {
+                    app.input_mode = handle_bench_prompt_input(app, key.code, prompt)?;
+                }
+            }
         },
         Event::Mouse(mouse) => handle_mouse_event(app, mouse),
         _ => {}
@@ -606,8 +774,12 @@ fn handle_events(app: &mut App) -> Result<()> {
 // Keyboard handlers
 // ---------------------------------------------------------------------------
 fn handle_normal_key(app: &mut App, code: KeyCode) -> Result<()> {
+    if app.bench_detail.is_some() {
+        app.bench_detail = None;
+        return Ok(());
+    }
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => {
+        KeyCode::Char('q') => {
             app.should_quit = true;
         }
         KeyCode::Tab => {
@@ -635,6 +807,11 @@ fn handle_normal_key(app: &mut App, code: KeyCode) -> Result<()> {
                     }
                 }
             },
+            Tab::Bench => {
+                if app.bench_selected + 1 < app.bench_results.len() {
+                    app.bench_selected += 1;
+                }
+            }
             _ => {}
         },
         KeyCode::Up | KeyCode::Char('k') => match app.tab {
@@ -654,6 +831,11 @@ fn handle_normal_key(app: &mut App, code: KeyCode) -> Result<()> {
                     }
                 }
             },
+            Tab::Bench => {
+                if app.bench_selected > 0 {
+                    app.bench_selected -= 1;
+                }
+            }
             _ => {}
         },
         KeyCode::Left | KeyCode::Char('h') if app.tab == Tab::Keys => {
@@ -679,13 +861,21 @@ fn handle_normal_key(app: &mut App, code: KeyCode) -> Result<()> {
                 let _ = app.run_health_check();
                 let _ = app.refresh_tab_data();
             }
+            Tab::Bench => {
+                let _ = app.run_benchmark(Some(app.bench_selected));
+            }
             _ => {}
         },
         KeyCode::Char('r') => {
             let _ = app.refresh_tab_data();
         }
         KeyCode::Char('c') => {
-            app.popup_message = None;
+            if app.bench_running {
+                app.bench_cancel.store(true, Ordering::SeqCst);
+                app.bench_cancelled = true;
+            } else {
+                app.popup_message = None;
+            }
         }
         KeyCode::Char('a') if app.tab == Tab::Keys => {
             app.input_mode = InputMode::AddKey {
@@ -717,6 +907,28 @@ fn handle_normal_key(app: &mut App, code: KeyCode) -> Result<()> {
                 requires_disable_traffic: false,
                 focused_field: 0,
             };
+        }
+        KeyCode::Char('p') if app.tab == Tab::Bench => {
+            app.input_mode = InputMode::BenchPrompt {
+                prompt: app.bench_prompt.clone(),
+            };
+        }
+        KeyCode::Char('a') if app.tab == Tab::Bench => {
+            let _ = app.run_benchmark(None);
+        }
+        KeyCode::Char('e') if app.tab == Tab::Bench => {
+            if !app.bench_running {
+                if let Some(pr) = app.bench_results.get(app.bench_selected) {
+                    if pr.success_count() == 0 {
+                        let detail = pr
+                            .results
+                            .first()
+                            .and_then(|r| r.error.clone())
+                            .unwrap_or_else(|| "No error message".to_string());
+                        app.bench_detail = Some(detail);
+                    }
+                }
+            }
         }
         KeyCode::Char('e') if app.tab == Tab::Providers && !app.providers.is_empty() => {
             if let Some(p) = app.providers.get(app.selected_provider) {
@@ -842,11 +1054,11 @@ fn handle_confirm_delete_input(
     _key_label: String,
 ) -> Result<InputMode> {
     match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
             let _ = app.delete_selected_key(key_id);
             Ok(InputMode::Normal)
         }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Ok(InputMode::Normal),
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => Ok(InputMode::Normal),
         _ => Ok(InputMode::ConfirmDelete {
             key_id,
             key_label: _key_label,
@@ -1131,11 +1343,11 @@ fn handle_confirm_delete_provider_input(
     _provider_name: String,
 ) -> Result<InputMode> {
     match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
             let _ = app.delete_selected_provider(provider_id);
             Ok(InputMode::Normal)
         }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Ok(InputMode::Normal),
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => Ok(InputMode::Normal),
         _ => Ok(InputMode::ConfirmDeleteProvider {
             provider_id,
             provider_name: _provider_name,
@@ -1401,6 +1613,26 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
             }
             return;
         }
+        InputMode::BenchPrompt { .. } => {
+            if let Some(name) = app.click_targets.hit_button(pos) {
+                match name {
+                    "bench_prompt_ok" => {
+                        let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+                        if let InputMode::BenchPrompt { prompt } = mode {
+                            if !prompt.is_empty() {
+                                app.bench_prompt = prompt;
+                            }
+                        }
+                    }
+                    "bench_prompt_cancel" => {
+                        app.input_mode = InputMode::Normal;
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            return;
+        }
         _ => {}
     }
 
@@ -1421,6 +1653,11 @@ fn handle_click(app: &mut App, col: u16, row: u16) {
         Tab::Providers => {
             if let Some(idx) = app.click_targets.hit_provider_row(pos) {
                 app.selected_provider = idx;
+            }
+        }
+        Tab::Bench => {
+            if let Some(idx) = app.click_targets.hit_bench_row(pos) {
+                app.bench_selected = idx;
             }
         }
         Tab::Keys => {
@@ -1505,6 +1742,12 @@ fn handle_button_click(app: &mut App, name: &str) {
             let _ = app.run_health_check();
             let _ = app.refresh_tab_data();
         }
+        "bench_run" if app.tab == Tab::Bench => {
+            let _ = app.run_benchmark(Some(app.bench_selected));
+        }
+        "bench_all" if app.tab == Tab::Bench => {
+            let _ = app.run_benchmark(None);
+        }
         "refresh" => {
             let _ = app.refresh_tab_data();
         }
@@ -1545,6 +1788,13 @@ fn handle_scroll(app: &mut App, up: bool) {
                 }
             }
         },
+        Tab::Bench => {
+            if up && app.bench_selected > 0 {
+                app.bench_selected -= 1;
+            } else if !up && app.bench_selected + 1 < app.bench_results.len() {
+                app.bench_selected += 1;
+            }
+        }
         _ => {}
     }
 }
@@ -1572,6 +1822,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         Tab::Keys => render_keys(frame, app, main_layout[1]),
         Tab::Usage => render_usage(frame, app, main_layout[1]),
         Tab::Health => render_health(frame, app, main_layout[1]),
+        Tab::Bench => render_bench(frame, app, main_layout[1]),
     }
 
     render_footer(frame, app, main_layout[2]);
@@ -1582,6 +1833,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
         InputMode::Normal => {
             if let Some(msg) = app.popup_message.clone() {
                 render_popup(frame, app, &msg);
+            }
+            if let Some(detail) = app.bench_detail.clone() {
+                render_bench_detail(frame, app, &detail);
             }
         }
         InputMode::AddKey {
@@ -1656,6 +1910,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
             provider_name,
         } => {
             render_confirm_delete_provider(frame, app, *provider_id, provider_name);
+        }
+        InputMode::BenchPrompt { prompt } => {
+            render_bench_prompt_form(frame, app, prompt);
         }
     }
 }
@@ -1757,18 +2014,65 @@ fn render_footer(frame: &mut Frame, app: &mut App, area: Rect) {
             } else if app.tab == Tab::Providers {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
+                    "Enter",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(" use  "));
+                spans.push(Span::styled(
                     "a/e/d",
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ));
                 spans.push(Span::raw(" add/edit/del"));
+            } else if app.tab == Tab::Health {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    "Enter",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(" check"));
+            } else if app.tab == Tab::Bench {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    "Enter",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(" run  "));
+                spans.push(Span::styled(
+                    "a",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(" run all  "));
+                spans.push(Span::styled(
+                    "p",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(" edit prompt  "));
+                spans.push(Span::styled(
+                    "e",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(" detail"));
             }
             Line::from(spans)
         }
         InputMode::AddKey { .. }
         | InputMode::AddProvider { .. }
-        | InputMode::EditProvider { .. } => Line::from(vec![
+        | InputMode::EditProvider { .. }
+        | InputMode::BenchPrompt { .. } => Line::from(vec![
             Span::styled(
                 "Tab",
                 Style::default()
@@ -1795,14 +2099,14 @@ fn render_footer(frame: &mut Frame, app: &mut App, area: Rect) {
         InputMode::ConfirmDelete { .. } | InputMode::ConfirmDeleteProvider { .. } => {
             Line::from(vec![
                 Span::styled(
-                    "y",
+                    "Enter/y",
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" confirm  "),
                 Span::styled(
-                    "n/Esc",
+                    "Esc/n",
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -1825,6 +2129,7 @@ fn render_footer(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Providers => 4, // Switch, Add, Edit, Remove
         Tab::Health => 1,    // Check
         Tab::Usage => 0,
+        Tab::Bench => 2,     // Run, Run All
     };
     for _ in 0..tab_button_count {
         button_constraints.push(Constraint::Length(12));
@@ -1861,6 +2166,11 @@ fn render_footer(frame: &mut Frame, app: &mut App, area: Rect) {
             render_button(frame, app, "check", " Check ", btn_layout[btn_idx]);
         }
         Tab::Usage => {}
+        Tab::Bench => {
+            render_button(frame, app, "bench_run", " Run ", btn_layout[btn_idx]);
+            btn_idx += 1;
+            render_button(frame, app, "bench_all", " Run All ", btn_layout[btn_idx]);
+        }
     }
 }
 
@@ -2229,6 +2539,237 @@ fn render_usage(frame: &mut Frame, app: &mut App, area: Rect) {
 
         frame.render_widget(table, layout[1]);
     }
+}
+
+fn render_bench(frame: &mut Frame, app: &mut App, area: Rect) {
+    let layout = Layout::new(
+        Direction::Vertical,
+        [Constraint::Min(0), Constraint::Length(6)],
+    )
+    .split(area);
+
+    // Results table
+    if app.bench_results.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No benchmark results. Press Enter or click [Run All] to start.")
+                .block(Block::default().borders(Borders::ALL).title("Benchmark")),
+            layout[0],
+        );
+    } else {
+        let rows: Vec<Row> = app
+            .bench_results
+            .iter()
+            .enumerate()
+            .map(|(i, pr)| {
+                let is_selected = i == app.bench_selected;
+                let is_running = app.bench_running
+                    && app.bench_current_provider.as_deref() == Some(&pr.provider_name);
+                let style = if is_selected {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+
+                let provider_cell = if is_running {
+                    Cell::from(Span::styled(
+                        format!("⠋ {}", pr.provider_name),
+                        style.fg(Color::Yellow),
+                    ))
+                } else {
+                    Cell::from(pr.provider_name.clone())
+                };
+
+                if pr.success_count() > 0 {
+                    Row::new(vec![
+                        provider_cell,
+                        Cell::from(pr.model.clone()),
+                        Cell::from(format!("{:.0}", pr.avg_ttft_ms())),
+                        Cell::from(format!("{:.0}", pr.avg_total_ms())),
+                        Cell::from(format!("{:.1}", pr.avg_tps())),
+                        Cell::from(format!("{}/{}", pr.success_count(), pr.results.len())),
+                    ])
+                    .style(style)
+                } else {
+                    let _err = pr
+                        .results
+                        .first()
+                        .and_then(|r| r.error.as_deref())
+                        .unwrap_or("FAIL");
+                    Row::new(vec![
+                        provider_cell,
+                        Cell::from(pr.model.clone()),
+                        Cell::from("FAIL".to_string()),
+                        Cell::from("-".to_string()),
+                        Cell::from("-".to_string()),
+                        Cell::from(format!("0/{}", pr.results.len())),
+                    ])
+                    .style(if is_selected { style } else { style.fg(Color::Red) })
+                }
+            })
+            .collect();
+
+        let title = if app.bench_running {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let (spinner, elapsed) = match app.bench_started_at {
+                Some(t) => {
+                    let ms = t.elapsed().as_millis();
+                    let idx = (ms / 100) as usize % frames.len();
+                    (frames[idx], t.elapsed().as_secs_f64())
+                }
+                None => (frames[0], 0.0),
+            };
+            if app.bench_cancelled {
+                format!("Benchmark {} Cancelling... {:.1}s", spinner, elapsed)
+            } else {
+                format!("Benchmark {} running... {:.1}s (press c to cancel)", spinner, elapsed)
+            }
+        } else if app.bench_cancelled {
+            "Benchmark Results — Cancelled, partial results shown".to_string()
+        } else {
+            match &app.bench_last_run {
+                Some(ts) => format!("Benchmark Results — Last run: {}", ts),
+                None => "Benchmark Results (Enter/j/k, click [Run] / [Run All])".to_string(),
+            }
+        };
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(12),
+                Constraint::Length(24),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(8),
+            ],
+        )
+        .header(
+            Row::new(vec!["Provider", "Model", "TTFT(ms)", "Total(ms)", "Tok/s", "Rate"])
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .block(Block::default().borders(Borders::ALL).title(title));
+
+        frame.render_widget(table, layout[0]);
+
+        // Register row click targets
+        let inner = Rect::new(
+            layout[0].x + 1,
+            layout[0].y + 2,
+            layout[0].width.saturating_sub(2),
+            layout[0].height.saturating_sub(3),
+        );
+        for (i, _) in app.bench_results.iter().enumerate() {
+            let row_y = inner.y + i as u16;
+            if row_y < inner.bottom() {
+                let rect = Rect::new(inner.x, row_y, inner.width, 1);
+                app.click_targets.bench_rows.push((i, rect));
+            }
+        }
+    }
+
+    // Detail panel: show sample text and prompt
+    let detail_block = Block::default().borders(Borders::ALL).title("Detail");
+    frame.render_widget(detail_block.clone(), layout[1]);
+    let inner = detail_block.inner(layout[1]);
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Prompt: ", Style::default().fg(Color::Yellow)),
+        Span::raw(app.bench_prompt.chars().take(80).collect::<String>()),
+    ])];
+
+    if let Some(pr) = app.bench_results.get(app.bench_selected) {
+        if let Some(sample) = pr.sample_text() {
+            let text: String = sample.chars().take(100).collect();
+            lines.push(Line::from(vec![
+                Span::styled("Sample: ", Style::default().fg(Color::Yellow)),
+                Span::raw(text.replace('\n', " ")),
+            ]));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_bench_prompt_form(frame: &mut Frame, app: &mut App, prompt: &str) {
+    let area = frame.area();
+    let popup_area = centered_rect(70, 30, area);
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title("Edit Benchmark Prompt");
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let fields_layout = Layout::new(
+        Direction::Vertical,
+        [Constraint::Length(3), Constraint::Length(1), Constraint::Length(3)],
+    )
+    .split(inner);
+
+    // Input field
+    let input_style = Style::default().fg(Color::White);
+    let input = Paragraph::new(format!("{}_", prompt)).style(input_style).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Prompt (Enter to save, Esc to cancel)"),
+    );
+    frame.render_widget(input, fields_layout[0]);
+    app.click_targets.form_fields.push((0, fields_layout[0]));
+
+    // Buttons
+    let btn_layout = Layout::new(
+        Direction::Horizontal,
+        [Constraint::Length(12), Constraint::Length(12)],
+    )
+    .split(fields_layout[2]);
+    render_button(frame, app, "bench_prompt_ok", " OK ", btn_layout[0]);
+    render_button(frame, app, "bench_prompt_cancel", " Cancel ", btn_layout[1]);
+}
+
+fn handle_bench_prompt_input(
+    app: &mut App,
+    code: KeyCode,
+    mut prompt: String,
+) -> Result<InputMode> {
+    match code {
+        KeyCode::Enter => {
+            if !prompt.is_empty() {
+                app.bench_prompt = prompt;
+            }
+            Ok(InputMode::Normal)
+        }
+        KeyCode::Esc => Ok(InputMode::Normal),
+        KeyCode::Backspace => {
+            prompt.pop();
+            Ok(InputMode::BenchPrompt { prompt })
+        }
+        KeyCode::Char(c) => {
+            prompt.push(c);
+            Ok(InputMode::BenchPrompt { prompt })
+        }
+        _ => Ok(InputMode::BenchPrompt { prompt }),
+    }
+}
+
+fn render_bench_detail(frame: &mut Frame, _app: &mut App, detail: &str) {
+    let area = frame.area();
+    let popup_area = centered_rect(70, 50, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title("Error Detail (Esc/Enter/q to close)");
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let paragraph = Paragraph::new(detail)
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    frame.render_widget(paragraph, inner);
 }
 
 fn render_health(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -2709,7 +3250,18 @@ pub fn run(pool: DatabasePool) -> Result<()> {
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| ui(frame, app))?;
-        handle_events(app)?;
+        // While a bench is running we poll on a short timeout so the spinner
+        // animates and so we can drain the result channel without waiting on
+        // the next keypress. Otherwise block on input to stay quiet.
+        let timeout = if app.bench_running {
+            Duration::from_millis(150)
+        } else {
+            Duration::from_millis(500)
+        };
+        if event::poll(timeout)? {
+            handle_events(app)?;
+        }
+        app.poll_bench_results();
     }
     Ok(())
 }

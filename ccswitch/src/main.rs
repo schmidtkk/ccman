@@ -6,6 +6,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
+use ccswitch_core::benchmark::BenchmarkService;
 use ccswitch_core::health_check::HealthCheckService;
 use ccswitch_core::provider::{normalize_provider_name, ProviderService};
 use ccswitch_core::settings::SettingsManager;
@@ -237,6 +238,21 @@ fn main() -> Result<()> {
                 handle_provider_remove(&provider_service, &name)?;
             }
         },
+        cli::Commands::Bench { command } => {
+            let bench_service = BenchmarkService::new(
+                SqliteProviderRepository::new(pool.clone()),
+                SqliteApiKeyRepository::new(pool.clone()),
+            );
+            match command {
+                cli::BenchCommands::Run {
+                    provider,
+                    rounds,
+                    prompt,
+                } => {
+                    handle_bench_run(&bench_service, provider.as_deref(), rounds, prompt.as_deref())?;
+                }
+            }
+        }
         cli::Commands::Tui => {
             tui::run(pool)?;
         }
@@ -682,6 +698,87 @@ fn handle_health_status(
             last_check,
         );
     }
+    Ok(())
+}
+
+fn handle_bench_run(
+    service: &BenchmarkService<SqliteProviderRepository, SqliteApiKeyRepository>,
+    provider_name: Option<&str>,
+    rounds: usize,
+    prompt: Option<&str>,
+) -> Result<()> {
+    let prompt = prompt.unwrap_or(ccswitch_core::benchmark::default_prompt());
+    let max_tokens = ccswitch_core::benchmark::default_max_tokens();
+
+    let results = if let Some(name) = provider_name {
+        vec![service.bench_provider(name, prompt, max_tokens, rounds)?]
+    } else {
+        service.bench_all(prompt, max_tokens, rounds)?
+    };
+
+    if results.is_empty() {
+        println!("No providers with keys to benchmark.");
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "{:<12} {:<24} {:>10} {:>10} {:>8} {:>8} {:>6}",
+        "Provider", "Model", "TTFT(ms)", "Total(ms)", "Tokens", "Tok/s", "Rate"
+    );
+    println!("{}", "-".repeat(82));
+
+    // Sort by avg total time
+    let mut sorted = results;
+    sorted.sort_by(|a, b| {
+        a.avg_total_ms()
+            .partial_cmp(&b.avg_total_ms())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for pr in &sorted {
+        if pr.success_count() > 0 {
+            println!(
+                "{:<12} {:<24} {:>10.0} {:>10.0} {:>8.0} {:>8.1} {}/{}",
+                pr.provider_name,
+                truncate(&pr.model, 24),
+                pr.avg_ttft_ms(),
+                pr.avg_total_ms(),
+                pr.avg_tokens(),
+                pr.avg_tps(),
+                pr.success_count(),
+                pr.results.len(),
+            );
+        } else {
+            let err = pr
+                .results
+                .first()
+                .and_then(|r| r.error.as_deref())
+                .unwrap_or("unknown");
+            println!(
+                "{:<12} {:<24} {:>10} {:>10} {:>8} {:>8}  0/{}  {}",
+                pr.provider_name,
+                truncate(&pr.model, 24),
+                "FAIL",
+                "---",
+                "---",
+                "---",
+                pr.results.len(),
+                truncate(err, 50),
+            );
+        }
+    }
+
+    // Print sample responses
+    println!("{}", "-".repeat(82));
+    for pr in &sorted {
+        if let Some(sample) = pr.sample_text() {
+            let one_line: String = sample.chars().take(100).collect();
+            println!("  [{}] {}", pr.provider_name, one_line.replace('\n', " "));
+        }
+    }
+    println!();
+
     Ok(())
 }
 

@@ -223,7 +223,7 @@ pub struct KeyHealthStatus {
 /// `auth_header` is stored as e.g. `"Authorization: Bearer"` or `"X-Api-Key"`.
 /// - `"Authorization: Bearer"` → `("Authorization", "Bearer {key}")`
 /// - `"X-Api-Key"`            → `("X-Api-Key", "{key}")`
-fn parse_auth_header(auth_header: &str, key_value: &str) -> (String, String) {
+pub fn parse_auth_header(auth_header: &str, key_value: &str) -> (String, String) {
     match auth_header.split_once(':') {
         Some((name, template)) => {
             let name = name.trim().to_string();
