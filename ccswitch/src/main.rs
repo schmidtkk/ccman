@@ -3,15 +3,14 @@ mod tui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::PathBuf;
-use tracing::{debug, info};
+use tracing::debug;
 
 use ccswitch_core::benchmark::BenchmarkService;
 use ccswitch_core::health_check::HealthCheckService;
 use ccswitch_core::provider::{normalize_provider_name, ProviderService};
 use ccswitch_core::settings::SettingsManager;
 use ccswitch_core::usage_tracker::UsageTracker;
-use ccswitch_db::migrations::run_migrations_from_dir;
+use ccswitch_db::migrations::run_embedded_migrations;
 use ccswitch_db::pool::DatabasePool;
 use ccswitch_db::repositories::{
     ApiKeyRepository, ProviderRepository, SqliteApiKeyRepository, SqliteHealthCheckRepository,
@@ -270,37 +269,8 @@ fn initialize() -> Result<Services> {
     // Create database pool
     let pool = DatabasePool::new(&db_path)?;
 
-    // Run migrations
-    let exe_path = std::env::current_exe()?;
-    let exe_dir = exe_path.parent().context("Could not get exe directory")?;
-
-    // Try multiple locations for migrations
-    let mut migrations_paths = vec![
-        exe_dir.join("../migrations"),
-        exe_dir.join("../../migrations"),
-    ];
-
-    // Development fallback: use CARGO_MANIFEST_DIR when running from cargo
-    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let dev_path = PathBuf::from(manifest_dir).join("../migrations");
-        if dev_path.exists() {
-            migrations_paths.push(dev_path);
-        }
-    }
-
-    let mut migrations_applied = false;
-    for migrations_dir in &migrations_paths {
-        if migrations_dir.exists() {
-            run_migrations_from_dir(&pool, migrations_dir)?;
-            migrations_applied = true;
-            info!("Migrations applied from: {}", migrations_dir.display());
-            break;
-        }
-    }
-
-    if !migrations_applied {
-        anyhow::bail!("Could not find migrations directory");
-    }
+    // Run migrations (compiled into the binary so this works regardless of install location)
+    run_embedded_migrations(&pool)?;
 
     // Create repositories
     let provider_repo = SqliteProviderRepository::new(pool.clone());

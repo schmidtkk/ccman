@@ -4,6 +4,21 @@ use tracing::info;
 
 use crate::pool::DatabasePool;
 
+/// Migrations compiled into the binary. Ordered by filename.
+const EMBEDDED_MIGRATIONS: &[(&str, &str)] = &[
+    ("001_initial.sql", include_str!("../../migrations/001_initial.sql")),
+    ("002_fix_pricing.sql", include_str!("../../migrations/002_fix_pricing.sql")),
+];
+
+/// Run all migrations embedded in the binary at compile time.
+pub fn run_embedded_migrations(pool: &DatabasePool) -> Result<()> {
+    for (name, sql) in EMBEDDED_MIGRATIONS {
+        pool.execute_batch(sql)?;
+        info!("Migration applied: {}", name);
+    }
+    Ok(())
+}
+
 /// Run all SQL migrations from a directory.
 pub fn run_migrations_from_dir<P: AsRef<Path>>(
     pool: &DatabasePool,

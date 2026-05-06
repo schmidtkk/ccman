@@ -21,10 +21,7 @@ mod tests {
     }
 
     fn run_migrations(pool: &pool::DatabasePool) {
-        let sql = include_str!("../../migrations/001_initial.sql");
-        pool.execute_batch(sql).unwrap();
-        let sql = include_str!("../../migrations/002_fix_pricing.sql");
-        pool.execute_batch(sql).unwrap();
+        migrations::run_embedded_migrations(pool).unwrap();
     }
 
     #[test]
