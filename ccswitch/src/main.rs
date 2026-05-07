@@ -57,18 +57,22 @@ fn main() -> Result<()> {
                 println!("    endpoint: {}", p.base_url);
             }
         }
-        cli::Commands::Use { provider } => {
+        cli::Commands::Use { provider, global } => {
             let env_vars = provider_service.switch_to_provider(&provider)?;
             let normalized = normalize_provider_name(&provider);
 
             if normalized == "claude" {
-                settings_manager.clear_env_vars()?;
+                if global {
+                    settings_manager.clear_env_vars()?;
+                }
                 println!("Switched to native Claude");
                 for key in &ccswitch_core::provider::CCSWITCH_ENV_KEYS {
                     println!("unset {}", key);
                 }
             } else {
-                settings_manager.write_env_vars(&env_vars)?;
+                if global {
+                    settings_manager.write_env_vars(&env_vars)?;
+                }
                 let display = provider_service
                     .get_provider(normalized)?
                     .map(|p| p.display_name.clone())

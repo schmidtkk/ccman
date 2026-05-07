@@ -19,6 +19,9 @@ pub enum Commands {
     Use {
         /// Provider name (kimi, glm, minimax, zhongzhuan, claude)
         provider: String,
+        /// Also write to ~/.claude/settings.json (affects all sessions and new terminals)
+        #[arg(long, short = 'g')]
+        global: bool,
     },
 
     /// Show current provider status
